@@ -8,10 +8,11 @@
 
 SLURM_NTASKS=4
 
-echo 'BEGIN BUILD SCRIPT'
+echo "BEGIN BUILD SCRIPT $(date)"
 
 echo "DETECTED: build name ->${build_name}<-"
 echo "DETECTED: configure arguments ->${configure_arguments}<-"
+date
 
 module load anaconda/miniconda-latest
 eval "$(conda shell.bash hook)"
@@ -39,4 +40,4 @@ echo "begin compile using ninja..."
 ninja -j$SLURM_NTASKS -Cbuild/cmake install
 echo "... finished with ninja"
 
-echo 'END BUILD SCRIPT'
+echo "END BUILD SCRIPT $(date)"

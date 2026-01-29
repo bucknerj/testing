@@ -1,0 +1,4 @@
+charmm
+env
+install-*
+slurm-*.out

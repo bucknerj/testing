@@ -1,4 +1,5 @@
 charmm
 env
 install-*
+sccdftb_data
 slurm-*.out

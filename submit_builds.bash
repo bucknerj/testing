@@ -19,8 +19,9 @@ if [[ $# -eq 1 ]]; then
   echo "build $1 selected"
   name=$1
   config="${configs[$name]}"
-    sbatch --job-name="$name.build" \
+  sbatch --job-name="$name-build" \
          --export=ALL,build_name="$name",configure_arguments="$config" \
+         -o "install-$name/%x-%j.out" \
          build.bash
   exit 0
 fi
@@ -29,5 +30,6 @@ for name in "${!configs[@]}"; do
   config="${configs[$name]}"
   sbatch --job-name="$name.build" \
          --export=ALL,build_name="$name",configure_arguments="$config" \
+         -o "install-$name/%x-%j.out" \
          build.bash
 done

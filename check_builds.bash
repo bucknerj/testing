@@ -1,6 +1,6 @@
 #!/bin/bash
 
-for outfile in $(ls slurm-*.out); do
+for outfile in $(ls install-*/*-build-*.out); do
   status=PASS
   grep -q fail $outfile
   if [[ "$?" -eq "0" ]]; then

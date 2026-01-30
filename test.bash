@@ -30,3 +30,5 @@ if [[ -d "${test_bench_dir}" ]]; then
   CMPDIR="${test_bench_dir}" ../tool/Compare "${test_out_dir}" " " \
         | tee compare.log
 fi
+
+echo "END TEST SCRIPT $(date)"

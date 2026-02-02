@@ -2,16 +2,21 @@
 
 module load anaconda/miniconda-latest
 eval "$(conda shell.bash hook)"
-conda create -p env/test
-conda activate /home/bucknerj/testing/env/test
+
+env_prefix="/home/bucknerj/testing/env/test"
+
+conda create -p "$env_prefix"
+conda activate "$env_prefix"
+
 conda install -c conda-forge \
-  openmm-torch cuda-toolkit cmake ninja fftw openmpi \
-  c-compiler cxx-compiler fortran-compiler \
-  pandas scipy pdoc
+  cuda-toolkit=12.9.* \
+  c-compiler=12.* cxx-compiler=12.* fortran-compiler=12.* \
+  openmpi \
+  cmake ninja fftw \
+  openmm-torch pandas scipy pdoc
 
 # Infiniband configuration
 echo "pml = ucx"  >> ${CONDA_PREFIX}/etc/openmpi-mca-params.conf
 echo "osc = ucx"  >> ${CONDA_PREFIX}/etc/openmpi-mca-params.conf
 
 git clone brooks:/export/git/charmm
-

@@ -70,7 +70,7 @@ if [[ $# -eq 1 ]]; then
   fi
   bench_dir=""
   args="${test_args[$test_name]} cmake $out_dir $bench_dir"
-  sbatch --job-name="$test_name-build" \
+  sbatch --job-name="$test_name.test" \
          --cpus-per-task=${threads[$test_name]} \
          --export=ALL,test_name="$test_name",test_args="$args",test_out_dir="$out_dir",test_bench_dir="${bench_dir}",build_name="${build_name}" \
          -o "install-$build_name/test/%x-%j.out" \
@@ -86,7 +86,7 @@ for test_name in "${tests[@]}"; do
   fi
   bench_dir=""
   args="${test_args[$test_name]} cmake $out_dir $bench_dir"
-  sbatch --job-name="$test_name-build" \
+  sbatch --job-name="$test_name.test" \
          --cpus-per-task=${threads[$test_name]} \
          --export=ALL,test_name="$test_name",test_args="$args",test_out_dir="$out_dir",test_bench_dir="${bench_dir}",build_name="${build_name}" \
          -o "install-$build_name/test/%x-%j.out" \

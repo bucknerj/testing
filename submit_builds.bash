@@ -4,6 +4,7 @@
 declare -A configs=(
   [gamus]='--with-gamus'
   [gpu]='-u --with-blade --with-fftdock --with-repdstr'
+  [gpu2]='-u --with-blade --with-fftdock --with-repdstr'
   [lite]='--lite -g'
   [ljpme]='--with-ljpme'
   [misc2]="--without-domdec --with-g09 -a 'DISTENE,MTS'"

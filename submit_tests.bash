@@ -50,9 +50,9 @@ if [[ $# -eq 1 ]]; then
   test_name=$1
   ntasks=${tasks[$test_name]}
   args="M $ntasks X 2 cmake output"
-  sbatch --job-name="$test_name.test" \
+  sbatch --job-name="$test_name-test" \
          --ntasks-per-node="$ntasks" \
-         --export=ALL,test_name="$test_name",test_args="$args"
+         --export=test_name="$test_name",test_args="$args" \
          -o "install-$test_name/test/%x-%j.out" \
          "test.bash"
   exit 0
@@ -61,9 +61,9 @@ fi
 for test_name in "${tests[@]}"; do
   ntasks=${tasks[$test_name]}
   args="M $ntasks X 2 cmake output"
-  sbatch --job-name="$test_name.test" \
+  sbatch --job-name="$test_name-test" \
          --ntasks-per-node="$ntasks" \
-         --export=ALL,test_name="$test_name",test_args="$args"
+         --export=test_name="$test_name",test_args="$args" \
          -o "install-$test_name/test/%x-%j.out" \
          "test.bash"
 done

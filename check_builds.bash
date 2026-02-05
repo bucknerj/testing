@@ -2,7 +2,7 @@
 
 npass=0
 nfail=0
-for outfile in $(ls install-*/*.build-*.out); do
+for outfile in $(ls install-*/*-build-*.out); do
   status=PASS
   grep -q fail $outfile
   if [[ "$?" -eq "0" ]]; then

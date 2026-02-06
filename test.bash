@@ -2,8 +2,6 @@
 #SBATCH --time=4:00:00
 #SBATCH -p gpu2080
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=2 \
-#SBATCH --gres=gpu:1
 
 echo "BEGIN TEST SCRIPT $(date)"
 

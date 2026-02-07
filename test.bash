@@ -24,7 +24,7 @@ fi
 /usr/bin/tcsh ./test2.com ${test_args} | tee "test.log" || true
 
 if [[ -d "./bench" ]]; then
-  CMPDIR="${test_bench_dir}" ../tool/Compare "${test_out_dir}" " " \
+  CMPDIR="bench" ../tool/Compare "output" " " \
         | tee compare.log
 fi
 

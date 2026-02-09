@@ -17,45 +17,65 @@ def setup_logging(logfile=None):
     logger.addHandler(handler)
     return logger
 
-def grep_output_file(build_name, test_name):
+def grep_output_file(path, pattern, status, negate):
+    grep_status = None
+    try:
+        if negate:
+            result = subprocess.run(["grep", "-L", pattern, path], stdout=subprocess.PIPE, text=True)
+            if result.stdout.strip():
+                grep_status = status
+        else:
+            result = subprocess.run(["grep", "-i", pattern, path], stdout=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                grep_status = status
+    except Exception:
+        grep_status = "ERROR (grep subprocess failed)"
+
+    return grep_status
+
+
+def loop_grep(build_name, test_name):
     path = f"install-{build_name}/test/output/{test_name}.out"
     if not os.path.exists(path):
         return "OUTPUT FILE NOT FOUND"
+
+    # pattern order matters for correct results
     patterns = [
-        ("TESTCASE RESULT: PASS", "PASSED", False),
-        ("Test Ok", "PASSED", False),
+        # bad patterns first
         ("TESTCASE RESULT: FAIL", "FAILED", False),
         ("ABNORMAL TERMINATION", "ABNORMAL TERMINATION", False),
+        ("TERMINATION", "NO TERMINATION", True),  # -L, i.e. NOT found
+        # good patterns next
+        ("TESTCASE RESULT: PASS", "PASSED", False),
+        ("Test Ok", "PASSED", False),
+        # meh patterns
         ("TESTCASE RESULT: SKIP", "SKIPPED", False),
-        ("test not performed", "SKIPPED", False),
-        ("TERMINATION", "NO TERMINATION", True), # -L, i.e. NOT found
+        ("test not performed", "SKIPPED", False)
     ]
     for pattern, status, negate in patterns:
-        try:
-            if negate:
-                result = subprocess.run(["grep", "-L", pattern, path], stdout=subprocess.PIPE, text=True)
-                if result.stdout.strip():
-                    return status
-            else:
-                result = subprocess.run(["grep", "-i", pattern, path], stdout=subprocess.PIPE, text=True)
-                if result.returncode == 0:
-                    return status
-        except Exception:
-            pass
-    return "OUTPUT OK"
+        grep_status = grep_output_file(path, pattern, status, negate)
+        if grep_status:
+            return grep_status
+
+    return None
+
 
 def extract_elapsed_time(build_name, test_name):
     path = f"install-{build_name}/test/output/{test_name}.out"
     if not os.path.exists(path):
         return None
+
     try:
         result = subprocess.run(["grep", "ELAPSED TIME:", path], stdout=subprocess.PIPE, text=True)
         match = re.search(r"ELAPSED TIME:\s+([\d\.]+)\s+SECONDS", result.stdout)
         if match:
             return float(match.group(1))
+
     except Exception:
         pass
+
     return None
+
 
 def get_all_build_names():
     rpt_files = glob.glob('install-*/test/output.rpt')
@@ -66,12 +86,31 @@ def get_all_build_names():
             build_names.append(m.group(1))
     return build_names
 
+
+def analyze_diff(diff_buffer, ignore):
+    """
+    Removes lines from diff_buffer that match any pattern in ignore.
+    Returns "BAD DIFF" if lines remain, else "PASSED".
+    """
+    filtered = []
+
+    for line in diff_buffer:
+        # If any ignore pattern matches, exclude this line
+        if any(re.search(pattern, line) for pattern in ignore):
+            continue
+        filtered.append(line)
+
+    return "BAD DIFF" if filtered else "PASSED"
+
+
 def normalize_status(status):
     if status.startswith("PASSED"):
         return "PASSED"
     if status.startswith("SKIPPED"):
         return "SKIPPED"
     if status.startswith("FAILED"):
+        return "FAILED"
+    if status.startswith("BAD DIFF"):
         return "FAILED"
     if status.startswith("ABNORMAL TERMINATION"):
         return "ERROR"
@@ -80,6 +119,7 @@ def normalize_status(status):
     if status.startswith("OUTPUT FILE NOT FOUND"):
         return "ERROR"
     return "ERROR"
+
 
 @click.command()
 @click.argument('build_names', nargs=-1)
@@ -131,6 +171,13 @@ def score(build_names, output, log):
 
     header_regex = re.compile(r'<\*\*\s*(\w+)\s*:\s*([\w\d_]+)\s*\*\*>\s*(.*)')
 
+    ignore = [
+        r"SET OMP_NUM_THREADS",
+        r"allocating kcmap",
+        r"^\d+c\d+$",  # matches lines like '1c1'
+        r"---"
+    ]
+
     results = []
     for build_name in my_builds:
         rpt_file = f"install-{build_name}/test/output.rpt"
@@ -141,13 +188,16 @@ def score(build_names, output, log):
         with open(rpt_file) as f:
             lines = f.readlines()
         current_test = {}
-        buffer = []
+        diff_buf = []
         for line in lines:
             header_match = header_regex.match(line)
             if header_match:
                 if current_test:
                     test_name = current_test['test_name']
-                    output_status = grep_output_file(build_name, test_name)
+                    output_status = loop_grep(build_name, test_name)
+                    if not output_status and diff_buf:
+                        output_status = analyze_diff(diff_buf, ignore)
+
                     elapsed_time = extract_elapsed_time(build_name, test_name)
                     status = normalize_status(output_status)
                     results.append({
@@ -161,17 +211,21 @@ def score(build_names, output, log):
                     })
                     if output:
                         logger.info(f"Rank {rank}: Finished test '{test_name}' in suite '{current_test['suite']}' with status '{status}'.")
-                    buffer = []
+                    diff_buf = []
                 current_test = {
                     'suite': header_match.group(1),
                     'test_name': header_match.group(2),
                     'timestamp': header_match.group(3).strip(),
                 }
             else:
-                buffer.append(line)
+                diff_buf.append(line)
+
         if current_test:
             test_name = current_test['test_name']
-            output_status = grep_output_file(build_name, test_name)
+            output_status = loop_grep(build_name, test_name)
+            if not output_status:
+                output_status = analyze_diff(diff_buf, ignore)
+
             elapsed_time = extract_elapsed_time(build_name, test_name)
             status = normalize_status(output_status)
             results.append({

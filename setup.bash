@@ -13,7 +13,8 @@ conda install -c conda-forge \
   c-compiler=12.* cxx-compiler=12.* fortran-compiler=12.* \
   openmpi \
   cmake ninja fftw \
-  openmm-torch pandas scipy pdoc
+  openmm-torch pandas scipy pdoc \
+  mpi4py click  # these last packages are for test output parsing only
 
 # Infiniband configuration
 echo "pml = ucx"  >> ${CONDA_PREFIX}/etc/openmpi-mca-params.conf

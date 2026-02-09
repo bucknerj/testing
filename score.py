@@ -143,8 +143,9 @@ def score_test(build_name, current_test, diff_buf, ignore):
 @click.command()
 @click.argument('build_names', nargs=-1)
 @click.option('-o', '--output', type=click.Path(writable=True), help='File to write JSON output.')
+@click.option('-p', '--prefix', type=click.Path(writable=True), help='File name prefix to write JSON output to each build test dir.')
 @click.option('--log', type=click.Path(writable=True), help='File to write log output. If not given, logs go to stdout.')
-def score(build_names, output, log):
+def score(build_names, output, prefix, log):
     """
     score.py: Process build test logs using MPI and output JSON summary.
 
@@ -152,26 +153,31 @@ def score(build_names, output, log):
     If none are given, all builds found under install-*/test/output.rpt will be processed.
 
     -o/--output: Output JSON to file.
+    -p/--prefix: Output JSON to file name prefix in each build test dir.
     --log: Write log messages to file instead of stdout.
     """
-    logger = setup_logging(log if output else None)  # Log to file if --log used, else to stdout if --output
+    logger = setup_logging(log if (output or prefix) else None)  # Log to file if --log used, else to stdout if --output or --prefix
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    if output:
-        # Only rank 0 will write output/log, but all ranks log their own progress if desired
-        logger.info(f"Rank {rank}: Starting score.py with output file '{output}' and log '{log or 'stdout'}'.")
+    if output and prefix:
+        prefix = False
+
+    if log:
+        # Only rank 0 will write output/log,
+        # but all ranks log their own progress if desired
+        logger.info(f"Rank {rank}: Starting score.py with out file '{output or prefix or 'stdout'}' and log '{log or 'stdout'}'.")
 
     # If no build_names provided, discover all
     if not build_names:
         build_names = get_all_build_names()
-        if output:
+        if log:
             logger.info(f"Rank {rank}: No build names given, found {len(build_names)} builds to process.")
     else:
         build_names = sorted(set(build_names))
-        if output:
+        if log:
             logger.info(f"Rank {rank}: Build names given: {build_names}")
 
     # Filter for actually existing builds
@@ -180,12 +186,12 @@ def score(build_names, output, log):
         rpt_file = f"install-{bn}/test/output.rpt"
         if os.path.exists(rpt_file):
             build_names_actual.append(bn)
-        elif output:
+        elif log:
             logger.warning(f"Rank {rank}: Build '{bn}' has no output.rpt, skipping.")
 
     # Partition builds to processes
     my_builds = build_names_actual[rank::size]
-    if output:
+    if log:
         logger.info(f"Rank {rank}: Assigned builds: {my_builds}")
 
     header_regex = re.compile(r'<\*\*\s*(\w+)\s*:\s*([\w\d_]+)\s*\*\*>\s*(.*)')
@@ -200,7 +206,7 @@ def score(build_names, output, log):
     results = []
     for build_name in my_builds:
         rpt_file = f"install-{build_name}/test/output.rpt"
-        if output:
+        if log:
             logger.info(f"Rank {rank}: Parsing '{rpt_file}'")
         if not os.path.exists(rpt_file):
             continue
@@ -214,7 +220,7 @@ def score(build_names, output, log):
                 if current_test:
                     test_result = score_test(build_name, current_test, diff_buf, ignore)
                     results.append(test_result)
-                    if output:
+                    if log:
                         logger.info(f"Rank {rank}: Finished test '{current_test['test_name']}' in suite '{current_test['suite']}' with status '{test_result['status']}'.")
                     diff_buf = []
                 current_test = {
@@ -228,20 +234,35 @@ def score(build_names, output, log):
         if current_test:
             test_result = score_test(build_name, current_test, diff_buf, ignore)
             results.append(test_result)
-            if output:
+            if log:
                 logger.info(f"Rank {rank}: Finished test '{current_test['test_name']}' in suite '{current_test['suite']}' with status '{test_result['status']}'.")
+        if log:
+            logger.info(f"Rank {rank}: Finished scoring build '{bn}'.")
 
-    all_results = comm.gather(results, root=0)
+        if prefix:
+            out_file = f"install-{build_name}/test/{prefix}.json"
+            if log: 
+                logger.info(f"Rank {rank}: Writing scores to '{out_file}'.")
 
-    if rank == 0:
+            with open(out_file, "w") as outjson:
+                json.dump(results, outjson, indent=2)
+
+            if log: 
+                logger.info(f"Rank {rank}: Finished writing scores to '{out_file}'.")
+
+    if not prefix:
+        all_results = comm.gather(results, root=0)
+
+    if (not prefix) and rank == 0:
         final_results = [item for sublist in all_results for item in sublist]
         final_results.sort(key=lambda test: (test['build_name'].lower(), test['suite'].lower(), test['test_name'].lower()))
-        if output:
+        if log:
             logger.info(f"Rank 0: Writing JSON output to '{output}'")
             with open(output, "w") as outjson:
                 json.dump(final_results, outjson, indent=2)
         else:
             print(json.dumps(final_results, indent=2))
+
 
 if __name__ == "__main__":
     score()

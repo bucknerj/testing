@@ -9,7 +9,7 @@ conda activate "$HOME/testing/env/test"
 
 pushd "$HOME/testing/"
 mpirun python score.py \
-    -o "results$current_date.json" \
+    --prefix "results$current_date" \
     --log "score$current_date.log"
 
 echo "END SCORE SCRIPT $(date)"

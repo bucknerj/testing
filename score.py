@@ -121,6 +121,25 @@ def normalize_status(status):
     return "ERROR"
 
 
+def score_test(build_name, current_test, diff_buf, ignore):
+    test_name = current_test['test_name']
+    output_status = loop_grep(build_name, test_name)
+    if not output_status and diff_buf:
+        output_status = analyze_diff(diff_buf, ignore)
+    
+    elapsed_time = extract_elapsed_time(build_name, test_name)
+    status = normalize_status(output_status)
+    return {
+        'build_name': build_name,
+        'suite': current_test['suite'],
+        'test_name': test_name,
+        'timestamp': current_test['timestamp'],
+        'status': status,
+        'output_status': output_status,
+        'elapsed_time': elapsed_time,
+    }
+
+
 @click.command()
 @click.argument('build_names', nargs=-1)
 @click.option('-o', '--output', type=click.Path(writable=True), help='File to write JSON output.')
@@ -193,24 +212,10 @@ def score(build_names, output, log):
             header_match = header_regex.match(line)
             if header_match:
                 if current_test:
-                    test_name = current_test['test_name']
-                    output_status = loop_grep(build_name, test_name)
-                    if not output_status and diff_buf:
-                        output_status = analyze_diff(diff_buf, ignore)
-
-                    elapsed_time = extract_elapsed_time(build_name, test_name)
-                    status = normalize_status(output_status)
-                    results.append({
-                        'build_name': build_name,
-                        'suite': current_test['suite'],
-                        'test_name': test_name,
-                        'timestamp': current_test['timestamp'],
-                        'status': status,
-                        'output_status': output_status,
-                        'elapsed_time': elapsed_time,
-                    })
+                    test_result = score_test(build_name, current_test, diff_buf, ignore)
+                    results.append(test_result)
                     if output:
-                        logger.info(f"Rank {rank}: Finished test '{test_name}' in suite '{current_test['suite']}' with status '{status}'.")
+                        logger.info(f"Rank {rank}: Finished test '{current_test['test_name']}' in suite '{current_test['suite']}' with status '{test_result['status']}'.")
                     diff_buf = []
                 current_test = {
                     'suite': header_match.group(1),
@@ -221,24 +226,10 @@ def score(build_names, output, log):
                 diff_buf.append(line)
 
         if current_test:
-            test_name = current_test['test_name']
-            output_status = loop_grep(build_name, test_name)
-            if not output_status:
-                output_status = analyze_diff(diff_buf, ignore)
-
-            elapsed_time = extract_elapsed_time(build_name, test_name)
-            status = normalize_status(output_status)
-            results.append({
-                'build_name': build_name,
-                'suite': current_test['suite'],
-                'test_name': test_name,
-                'timestamp': current_test['timestamp'],
-                'status': status,
-                'output_status': output_status,
-                'elapsed_time': elapsed_time,
-            })
+            test_result = score_test(build_name, current_test, diff_buf, ignore)
+            results.append(test_result)
             if output:
-                logger.info(f"Rank {rank}: Finished test '{test_name}' in suite '{current_test['suite']}' with status '{status}'.")
+                logger.info(f"Rank {rank}: Finished test '{current_test['test_name']}' in suite '{current_test['suite']}' with status '{test_result['status']}'.")
 
     all_results = comm.gather(results, root=0)
 

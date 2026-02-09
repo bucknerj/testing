@@ -12,8 +12,8 @@ def main():
     # Organize tests: suite -> test_name -> list of (build_name, status, output_status)
     problem_tests = defaultdict(lambda: defaultdict(list))
 
-    for test in data["results"]:
-        norm_status = test["normalized_status"]
+    for test in data:
+        norm_status = test["status"]
         if norm_status not in ("PASSED", "SKIPPED"):
             suite = test["suite"]
             test_name = test["test_name"]

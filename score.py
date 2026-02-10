@@ -17,6 +17,72 @@ def setup_logging(logfile=None):
     logger.addHandler(handler)
     return logger
 
+
+def parse_compare_output(filename):
+    """Parses a diff output file and returns test results by suite and test name.
+
+    The function scans a text file containing output from a test suite diffing framework.
+    It identifies test sections by header lines in the format:
+        "***Diffing: <** suite : test_name **>"
+    and determines whether each test PASSED or FAILED based on the presence of diff output
+    lines between headers. Any non-blank, non-header line between two headers causes FAILED status.
+    If there are only blank lines or header lines between sections, the test is marked as PASSED.
+
+    Args:
+        filename (str): Path to the diff output file to be parsed.
+
+    Returns:
+        dict: A nested dictionary of results in the format:
+            {
+                suite1: {
+                    test_name1: 'PASSED' or 'FAILED',
+                    test_name2: 'PASSED' or 'FAILED',
+                    ...
+                },
+                suite2: {
+                    ...
+                },
+                ...
+            }
+    """
+    header_pattern = re.compile(r"\*\*\*Diffing: <\*\* (\w+) : ([\w\-]+) \*\*>")
+    results = {}
+
+    current_suite = None
+    current_test = None
+    test_lines = []
+
+    with open(filename, "r") as infile:
+        lines = infile.readlines()
+
+    for line in lines:
+        header_match = header_pattern.match(line)
+        if header_match:
+            # Process previous test if present
+            if current_suite is not None and current_test is not None:
+                # If test_lines contains ONLY blank lines or lines that start with "***Diffing", it's PASSED
+                has_diff = any(l.strip() and not l.startswith('***Diffing') for l in test_lines)
+                status = "FAILED" if has_diff else "PASSED"
+                results.setdefault(current_suite, {})[current_test] = status
+
+            # Start new test
+            current_suite = header_match.group(1)
+            current_test = header_match.group(2)
+            test_lines = []
+        else:
+            # Collect lines between headers
+            if current_suite and current_test:
+                test_lines.append(line)
+
+    # Handle last test section
+    if current_suite is not None and current_test is not None:
+        has_diff = any(l.strip() and not l.startswith('***Diffing') for l in test_lines)
+        status = "FAILED" if has_diff else "PASSED"
+        results.setdefault(current_suite, {})[current_test] = status
+
+    return results
+
+
 def grep_output_file(path, pattern, status, negate):
     grep_status = None
     try:
@@ -25,7 +91,7 @@ def grep_output_file(path, pattern, status, negate):
             if result.stdout.strip():
                 grep_status = status
         else:
-            result = subprocess.run(["grep", "-i", pattern, path], stdout=subprocess.PIPE, text=True)
+            result = subprocess.run(["grep", pattern, path], stdout=subprocess.PIPE, text=True)
             if result.returncode == 0:
                 grep_status = status
     except Exception:
@@ -47,7 +113,7 @@ def loop_grep(build_name, test_name):
         ("TERMINATION", "NO TERMINATION", True),  # -L, i.e. NOT found
         # good patterns next
         ("TESTCASE RESULT: PASS", "PASSED", False),
-        ("Test Ok", "PASSED", False),
+        # ("Test Ok", "PASSED", False),
         # meh patterns
         ("TESTCASE RESULT: SKIP", "SKIPPED", False),
         ("test not performed", "SKIPPED", False)
@@ -87,20 +153,20 @@ def get_all_build_names():
     return build_names
 
 
-def analyze_diff(diff_buffer, ignore):
-    """
-    Removes lines from diff_buffer that match any pattern in ignore.
-    Returns "BAD DIFF" if lines remain, else "PASSED".
-    """
-    filtered = []
-
-    for line in diff_buffer:
-        # If any ignore pattern matches, exclude this line
-        if any(re.search(pattern, line) for pattern in ignore):
-            continue
-        filtered.append(line)
-
-    return "BAD DIFF" if filtered else "PASSED"
+# def analyze_diff(diff_buffer, ignore):
+#     """
+#     Removes lines from diff_buffer that match any pattern in ignore.
+#     Returns "BAD DIFF" if lines remain, else "PASSED".
+#     """
+#     filtered = []
+# 
+#     for line in diff_buffer:
+#         # If any ignore pattern matches, exclude this line
+#         if any(re.search(pattern, line) for pattern in ignore):
+#             continue
+#         filtered.append(line)
+# 
+#     return "BAD DIFF" if filtered else "PASSED"
 
 
 def normalize_status(status):
@@ -121,17 +187,21 @@ def normalize_status(status):
     return "ERROR"
 
 
-def score_test(build_name, current_test, diff_buf, ignore):
+def score_test(build_name, compare_results, current_test, diff_buf):
+    suite = current_test['suite']
     test_name = current_test['test_name']
     output_status = loop_grep(build_name, test_name)
-    if not output_status and diff_buf:
-        output_status = analyze_diff(diff_buf, ignore)
+    if (not output_status) and diff_buf:
+        # output_status = analyze_diff(diff_buf, ignore)
+        output_status = compare_results[suite][test_name]
+        if output_status != 'PASSED':
+            output_status = 'BAD DIFF'
     
     elapsed_time = extract_elapsed_time(build_name, test_name)
     status = normalize_status(output_status)
     return {
         'build_name': build_name,
-        'suite': current_test['suite'],
+        'suite': suite,
         'test_name': test_name,
         'timestamp': current_test['timestamp'],
         'status': status,
@@ -196,33 +266,37 @@ def score(build_names, output, prefix, log):
 
     header_regex = re.compile(r'<\*\*\s*(\w+)\s*:\s*([\w\d_]+)\s*\*\*>\s*(.*)')
 
-    ignore = [
-        r"SET OMP_NUM_THREADS",
-        r"allocating kcmap",
-        r"^\d+c\d+$",  # matches lines like '1c1'
-        r"---"
-    ]
-
     results = []
     for build_name in my_builds:
+        compare_file = f"install-{build_name}/test/compare.out"
+        if log:
+            logger.info(f"Rank {rank}: Parsing '{compare_file}'")
+
+        compare_results = parse_compare_output(compare_file)
+
         rpt_file = f"install-{build_name}/test/output.rpt"
         if log:
             logger.info(f"Rank {rank}: Parsing '{rpt_file}'")
+
         if not os.path.exists(rpt_file):
             continue
-        with open(rpt_file) as f:
+
+        with open(rpt_file, 'r') as f:
             lines = f.readlines()
+
         current_test = {}
         diff_buf = []
         for line in lines:
             header_match = header_regex.match(line)
             if header_match:
                 if current_test:
-                    test_result = score_test(build_name, current_test, diff_buf, ignore)
+                    test_result = score_test(build_name, compare_results,
+                            current_test, diff_buf)
                     results.append(test_result)
+                    diff_buf = []
                     if log:
                         logger.info(f"Rank {rank}: Finished test '{current_test['test_name']}' in suite '{current_test['suite']}' with status '{test_result['status']}'.")
-                    diff_buf = []
+
                 current_test = {
                     'suite': header_match.group(1),
                     'test_name': header_match.group(2),
@@ -232,10 +306,12 @@ def score(build_names, output, prefix, log):
                 diff_buf.append(line)
 
         if current_test:
-            test_result = score_test(build_name, current_test, diff_buf, ignore)
+            test_result = score_test(build_name, compare_results,
+                    current_test, diff_buf)
             results.append(test_result)
             if log:
                 logger.info(f"Rank {rank}: Finished test '{current_test['test_name']}' in suite '{current_test['suite']}' with status '{test_result['status']}'.")
+
         if log:
             logger.info(f"Rank {rank}: Finished scoring build '{bn}'.")
 

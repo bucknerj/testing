@@ -2,6 +2,18 @@ import json
 import sys
 from collections import defaultdict
 
+
+def uniquify_dicts(dict_list):
+    unique = []
+    seen = set()
+    for d in dict_list:
+        s = tuple(sorted(d.items()))
+        if s not in seen:
+            seen.add(s)
+            unique.append(d)
+    return unique
+
+
 def main():
     # Usage: python json_to_md_problem_tests.py test_summary.json
     input_file = sys.argv[1]
@@ -12,9 +24,13 @@ def main():
     # Organize tests: suite -> test_name -> list of (build_name, status, output_status)
     problem_tests = defaultdict(lambda: defaultdict(list))
 
+    ignore_status = ('PASSED', 'SKIPPED')
+    ignore_build = ('lite', )
+
     for test in data:
         norm_status = test["status"]
-        if norm_status not in ("PASSED", "SKIPPED"):
+        build = test["build_name"]
+        if (norm_status not in ignore_status) and (build not in ignore_build):
             suite = test["suite"]
             test_name = test["test_name"]
             build_info = {
@@ -31,6 +47,7 @@ def main():
         print(f"## Suite: `{suite}`")
         for test_name in sorted(problem_tests[suite]):
             builds = problem_tests[suite][test_name]
+            builds = uniquify_dicts(builds)
             print(f"- **Test:** `{test_name}`")
             for b in sorted(builds, key=lambda x: x["build_name"]):
                 status_str = b["status"]

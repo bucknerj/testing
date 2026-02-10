@@ -18,14 +18,10 @@ if [[ "${test_name}" == "sccdftb" ]] && [[ ! -L "./sccdftb.dat" ]]; then
   ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat
 fi
 
-if [[ ! -f "./test2.com" ]]; then
-  sed '/limit filesize/d' ./test.com > test2.com
-fi
-/usr/bin/tcsh ./test2.com ${test_args} | tee "test.log" || true
+/usr/bin/tcsh ./test.com ${test_args} | tee "test.log" || true
 
 if [[ -d "./bench" ]]; then
-  CMPDIR="bench" ../tool/Compare "output" " " \
-        | tee compare.log
+  awk -f compare.awk -v verbose=1 -v tol=0.0001 output.rpt > compare.out
 fi
 
 echo "END TEST SCRIPT $(date)"

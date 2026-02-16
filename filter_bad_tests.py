@@ -4,13 +4,13 @@ from collections import defaultdict
 
 
 builds = [
-    "gamus", "gpu", "gpu2", "lite", "ljpme", "misc", "misc2", "mndo97",
+    "gamus", "gpu", "gpu2", "ljpme", "misc", "misc2", "mndo97",
     "sccdftb", "squantm", "stringm", "tamd"
 ]
 data = []
 
 for bn in builds:
-    with open(f"install-{bn}/test/results20260210_1216.json") as f:
+    with open(f"install-{bn}/test/results20260211_1409.json") as f:
         data += json.load(f)
   
 bad_tests = [test for test in data

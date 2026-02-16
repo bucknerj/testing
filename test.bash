@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --time=4:00:00
-#SBATCH -p gpu2080
+#SBATCH -p ada5000
 #SBATCH --nodes=1
 
 echo "BEGIN TEST SCRIPT $(date)"

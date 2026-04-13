@@ -1,8 +1,13 @@
-charmm
-env
-install-*
-sccdftb_data
+# CHARMM source and build trees
+charmm/
+env/
+install-*/
+sccdftb_data/
+
+# Slurm output
 slurm-*.out
-*.md
-*.json
+
+# Test artifacts
 *.log
+*.json
+*.xml

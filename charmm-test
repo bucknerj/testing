@@ -1,0 +1,1526 @@
+#!/usr/bin/env python3
+"""charmm-test -- unified CLI for CHARMM Slurm build/test/grade pipeline.
+
+A single tool replacing the dozen scripts that previously made up the
+CHARMM testing pipeline. It manages the full lifecycle: submitting Slurm
+build and test jobs, grading results with numerical tolerance, promoting
+outputs to benchmarks, and archiving old results.
+
+Subcommands:
+    list        Show all build/test configurations
+    build       Submit Slurm build jobs (pulls latest CHARMM source first)
+    test        Submit Slurm test jobs
+    run         Build then test, chained via Slurm dependencies
+    grade       Grade test results with numerical tolerance comparison
+    status      Show active Slurm jobs
+    bench       Promote test output to benchmark
+    clean       Archive old test results
+    prereqs     Check that all prerequisites are in place
+
+Example usage::
+
+    charmm-test list
+    charmm-test run gpu sccdftb
+    charmm-test status
+    charmm-test grade --tol 0.001
+
+Prerequisites:
+    See ``charmm-test prereqs`` or the `Prerequisites` section below.
+
+Generating documentation:
+    This script is self-documenting via docstrings. Generate HTML docs with::
+
+        pdoc ./charmm-test -o docs/
+
+    Or, if pdoc requires a ``.py`` extension::
+
+        ln -s charmm-test charmm_test.py && pdoc charmm_test -o docs/
+
+Prerequisites
+-------------
+This script expects a specific directory layout under ``~/testing/``
+(configurable via `TESTING_HOME`):
+
+Directory layout::
+
+    ~/testing/
+    ├── charmm-test          # this script
+    ├── setup.bash           # one-time environment setup
+    ├── charmm/              # CHARMM source (git clone)
+    │   ├── tool/
+    │   │   └── NewCharmmTree
+    │   ├── configure
+    │   └── ...
+    ├── env/
+    │   └── test/            # conda/micromamba environment prefix
+    ├── sccdftb_data/        # (optional) SCCDFTB parameters
+    │   └── sccdftb.dat
+    └── install-<name>/      # per-config build trees (created by build)
+        ├── configure
+        ├── build/cmake/
+        └── test/
+            ├── test.com
+            ├── bench/       # benchmark outputs
+            ├── output/      # test outputs
+            └── output.rpt   # diff report from test.com
+
+Required software (available in the conda env or via modules):
+
+- **Python 3.8+** (stdlib only -- no third-party packages needed)
+- **Slurm** (sbatch, squeue) on the cluster
+- **Ninja** build system
+- **CMake** (called by CHARMM's ``./configure``)
+- **Fortran/C/C++ compilers** (gcc, gfortran, or Intel via modules)
+- **MPI** (OpenMPI or Intel MPI) for parallel test configs
+- **CUDA toolkit** for GPU configs (gpu, gpu2)
+- **tcsh** (``/usr/bin/tcsh``) for running ``test.com``
+- **Git** for pulling latest CHARMM source
+
+The conda environment at ``env/test/`` should provide compilers, cmake,
+ninja, fftw, openmm, and any other libraries needed by ``./configure``.
+See ``setup.bash`` for the exact ``conda create`` invocation.
+
+Cluster environment modules (loaded by embedded Slurm scripts):
+
+- ``anaconda/miniconda-latest`` -- provides ``conda`` command
+- The conda env at ``~/testing/env/test`` must be pre-created
+
+Note: This script itself runs on the **login node** (submitting jobs).
+The actual builds and tests run inside Slurm jobs on compute nodes.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+
+
+# ─── Configuration ─────────────────────────────────────────────────
+
+TESTING_HOME = Path.home() / 'testing'
+"""Root directory for the testing pipeline. All paths are relative to this."""
+
+CHARMM_DIR = TESTING_HOME / 'charmm'
+"""Path to the CHARMM source repository (git clone)."""
+
+CONDA_ENV = TESTING_HOME / 'env' / 'test'
+"""Conda/micromamba environment prefix used by Slurm jobs."""
+
+DEFAULT_TOL = 0.0001
+"""Default numerical tolerance for grading.
+
+A relative tolerance of 1e-4 is appropriate for CHARMM MD energy values
+from medium-to-small systems. The comparison uses ``|a-b|/max(|a|,|b|)``
+when the denominator exceeds ``tol^2``, matching the logic in the
+original ``compare.awk`` by C.L. Brooks III (Scripps, 2003).
+"""
+
+PIP_LOCK = '-D pip_lock=ON'
+"""CMake flag appended to all configure commands.
+
+Enables file-based locking (via ``tool/cmake/pip_locked.py``) so that
+concurrent builds sharing the same conda environment serialize their
+``pip install`` of pycharmm. Without this, parallel builds can corrupt
+the Python environment.
+"""
+
+CONFIGS = {
+    'gamus': {
+        'configure': f'--with-gamus {PIP_LOCK}',
+        'test_args': 'cmake',
+        'description': 'GAMUS QM/MM interface',
+    },
+    'gpu': {
+        'configure': f'-u --with-blade --with-fftdock --with-repdstr {PIP_LOCK}',
+        'test_args': 'cmake',
+        'gpus': 2,
+        'description': 'GPU (BLaDE + FFTDock + REPDSTR), serial tests',
+    },
+    'gpu2': {
+        'configure': f'-u --with-blade --with-fftdock --with-repdstr {PIP_LOCK}',
+        'test_args': 'M 2 X 2 cmake',
+        'gpus': 2,
+        'description': 'GPU (BLaDE + FFTDock + REPDSTR), parallel tests',
+    },
+    'lite': {
+        'configure': f'--lite -g {PIP_LOCK}',
+        'test': False,
+        'description': 'Minimal build (compile-only, no tests)',
+    },
+    'ljpme': {
+        'configure': f'--with-ljpme {PIP_LOCK}',
+        'test_args': 'M 2 X 2 cmake',
+        'description': 'Lennard-Jones PME',
+    },
+    'misc': {
+        'configure': f"-a ABPO,ADUMBRXNCOR,ROLLRXNCOR,CORSOL,CVELOCI,PINS,"
+                     f"ENSEMBLE,SAMC,MCMA,GSBP,PIPF,POLAR,PNM,RISM,CONSPH,"
+                     f"RUSH,TMD,DIMS,MSCALE,EDS {PIP_LOCK}",
+        'test_args': 'M 2 X 2 cmake',
+        'description': 'Miscellaneous keyword bundle (14 keywords)',
+    },
+    'misc2': {
+        'configure': f"--without-domdec --with-g09 -a DISTENE,MTS {PIP_LOCK}",
+        'test_args': 'M 2 X 2 cmake',
+        'description': 'Misc (no DOMDEC, Gaussian 09, DISTENE, MTS)',
+    },
+    'mndo97': {
+        'configure': f'--with-mndo97 {PIP_LOCK}',
+        'test_args': 'cmake',
+        'description': 'MNDO97 semi-empirical QM/MM',
+    },
+    'sccdftb': {
+        'configure': f'--with-sccdftb {PIP_LOCK}',
+        'test_args': 'cmake',
+        'description': 'SCC-DFTB tight-binding DFT',
+    },
+    'squantm': {
+        'configure': f'--with-squantm {PIP_LOCK}',
+        'test_args': 'cmake',
+        'description': 'SQuANTM QM/MM interface',
+    },
+    'stringm': {
+        'configure': f'--with-stringm {PIP_LOCK}',
+        'test_args': 'M 8 X 2 cmake',
+        'description': 'String method (8 MPI ranks)',
+    },
+    'tamd': {
+        'configure': f'--without-mpi -a TAMD {PIP_LOCK}',
+        'test_args': 'cmake',
+        'description': 'Temperature-accelerated MD (serial, no MPI)',
+    },
+    'pycharmm': {
+        'configure': f'--with-fftdock {PIP_LOCK}',
+        'test_type': 'pytest',
+        'description': 'pyCHARMM Python interface (pytest)',
+    },
+}
+"""Build/test configurations.
+
+Each entry is a dict with:
+
+- **configure** (str): Arguments passed to CHARMM's ``./configure`` script.
+- **test_args** (str, optional): Arguments for ``test.com``. The word
+  ``output`` is appended automatically. ``M N`` sets MPI ranks to N,
+  ``X T`` sets threads per rank to T. Absent means no test suite.
+- **test_type** (str, optional): ``'pytest'`` for pycharmm tests instead
+  of ``test.com``. Defaults to ``test.com`` if absent.
+- **gpus** (int, optional): Number of GPUs to request. Defaults to
+  `SLURM_DEFAULT_GPUS`.
+- **test** (bool, optional): Set ``False`` for build-only configs.
+- **description** (str): Human-readable description of the config.
+"""
+
+# ─── Slurm defaults ───────────────────────────────────────────────
+
+SLURM_PARTITION = 'ada5000'
+"""Slurm partition for all jobs."""
+
+SLURM_BUILD_TIME = '4:00:00'
+"""Wall-time limit for build jobs."""
+
+SLURM_TEST_TIME = '4:00:00'
+"""Wall-time limit for test jobs."""
+
+SLURM_BUILD_CPUS = 4
+"""CPUs per build job (used for ``ninja -j``)."""
+
+SLURM_DEFAULT_GPUS = 1
+"""Default GPU count when not specified per-config."""
+
+
+# ─── Embedded Slurm job scripts ───────────────────────────────────
+
+BUILD_SCRIPT = textwrap.dedent("""\
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "=== BUILD ${build_name} === $(date)"
+    echo "configure: ${configure_arguments}"
+
+    module load anaconda/miniconda-latest
+    eval "$(conda shell.bash hook)"
+    conda activate "$HOME/testing/env/test"
+
+    cd "$HOME/testing"
+
+    if [[ ! -d "install-${build_name}" ]]; then
+        echo "Creating new CHARMM tree: install-${build_name}"
+        charmm/tool/NewCharmmTree "install-${build_name}"
+    fi
+
+    rm -rf "install-${build_name}/build/cmake"
+
+    cd "install-${build_name}"
+    ./configure --with-ninja ${configure_arguments}
+    ninja -j${SLURM_CPUS_PER_TASK:-4} -Cbuild/cmake install
+
+    echo "=== BUILD ${build_name} DONE === $(date)"
+""")
+"""Bash script submitted to Slurm for build jobs.
+
+Expects two environment variables exported by sbatch:
+
+- ``build_name``: config name (e.g. 'gpu', 'sccdftb')
+- ``configure_arguments``: flags for ``./configure``
+
+Uses ``SLURM_CPUS_PER_TASK`` (set by Slurm from ``--cpus-per-task``)
+for ninja parallelism. Creates a new CHARMM tree via
+``tool/NewCharmmTree`` if one doesn't exist yet.
+"""
+
+TEST_SCRIPT = textwrap.dedent("""\
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "=== TEST ${test_name} === $(date)"
+    echo "test_args: ${test_args}"
+
+    module load anaconda/miniconda-latest
+    eval "$(conda shell.bash hook)"
+    conda activate "$HOME/testing/env/test"
+
+    cd "$HOME/testing/install-${test_name}/test"
+
+    # Link sccdftb data if needed
+    if [[ "${test_name}" == "sccdftb" ]] && [[ ! -L "./sccdftb.dat" ]]; then
+        ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat
+    fi
+
+    # Run test suite; test.com produces output.rpt for grading
+    # Grading is done separately by: charmm-test grade
+    /usr/bin/tcsh ./test.com ${test_args} 2>&1 | tee test.log || true
+
+    echo "=== TEST ${test_name} DONE === $(date)"
+""")
+"""Bash script submitted to Slurm for test jobs.
+
+Expects two environment variables exported by sbatch:
+
+- ``test_name``: config name (e.g. 'gpu', 'sccdftb')
+- ``test_args``: arguments for ``test.com`` including ``output``
+
+Runs ``test.com`` which executes all test inputs and produces
+``output.rpt`` (a sed-filtered diff of test output vs benchmarks).
+The ``output.rpt`` is later parsed by ``charmm-test grade``.
+
+For the sccdftb config, symlinks ``sccdftb.dat`` parameter data
+if not already present.
+"""
+
+PYTEST_SCRIPT = textwrap.dedent("""\
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "=== PYTEST ${test_name} === $(date)"
+
+    module load anaconda/miniconda-latest
+    eval "$(conda shell.bash hook)"
+    conda activate "$HOME/testing/env/test"
+
+    cd "$HOME/testing/install-${test_name}"
+    export CHARMM_DATA_DIR=$(pwd)/toppar
+
+    cd tool/pycharmm
+    pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
+
+    echo "=== PYTEST ${test_name} DONE === $(date)"
+""")
+"""Bash script submitted to Slurm for pycharmm pytest jobs.
+
+Expects one environment variable exported by sbatch:
+
+- ``test_name``: config name (e.g. 'pycharmm')
+
+Sets ``CHARMM_DATA_DIR`` to the install tree's ``toppar/`` directory
+so tests can find CHARMM parameter files. pycharmm itself is already
+pip-installed during the build (``ninja install``).
+
+Produces ``pytest-results.xml`` (JUnit XML) and ``pytest.log``.
+"""
+
+
+# ─── Terminal colors ───────────────────────────────────────────────
+
+class Color:
+    """ANSI color codes for terminal output.
+
+    Colors are automatically disabled when stdout is not a TTY
+    (e.g. when piped to a file or another program).
+    """
+    PASS = '\033[92m'
+    FAIL = '\033[91m'
+    ERROR = '\033[91m'
+    SKIP = '\033[93m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+
+    @classmethod
+    def disable(cls):
+        """Turn off all color codes (for non-TTY output)."""
+        cls.PASS = cls.FAIL = cls.ERROR = cls.SKIP = ''
+        cls.BOLD = cls.DIM = cls.RESET = ''
+
+
+def colored(text, color):
+    """Wrap text in ANSI color codes."""
+    return f'{color}{text}{Color.RESET}'
+
+
+# ─── Helpers ───────────────────────────────────────────────────────
+
+def parse_slurm_params(test_args):
+    """Derive Slurm ntasks and cpus-per-task from a test_args string.
+
+    The test_args format uses ``M N`` for MPI rank count and ``X T``
+    for threads per rank, matching the ``test.com`` conventions.
+
+    Args:
+        test_args: String like ``'M 2 X 2 cmake'`` or ``'cmake'``.
+
+    Returns:
+        Tuple of (ntasks, cpus_per_task), both defaulting to 1.
+    """
+    ntasks = 1
+    cpus = 1
+    if test_args:
+        m = re.search(r'M\s+(\d+)', test_args)
+        if m:
+            ntasks = int(m.group(1))
+        m = re.search(r'X\s+(\d+)', test_args)
+        if m:
+            cpus = int(m.group(1))
+    return ntasks, cpus
+
+
+def resolve_names(args_names, require_test=False):
+    """Resolve config names from CLI arguments, defaulting to all.
+
+    Args:
+        args_names: List of config names from argparse, or empty for all.
+        require_test: If True, filter out build-only configs (test=False).
+
+    Returns:
+        Sorted list of valid config names.
+
+    Exits with error if any name is not in `CONFIGS`.
+    """
+    if args_names:
+        unknown = [n for n in args_names if n not in CONFIGS]
+        if unknown:
+            print(f"Unknown config(s): {', '.join(unknown)}", file=sys.stderr)
+            print(f"Available: {', '.join(sorted(CONFIGS))}", file=sys.stderr)
+            sys.exit(1)
+        names = args_names
+    else:
+        names = sorted(CONFIGS)
+
+    if require_test:
+        names = [n for n in names if CONFIGS[n].get('test', True)]
+    return names
+
+
+def install_dir(name):
+    """Return the install directory path for a config: ``~/testing/install-<name>``."""
+    return TESTING_HOME / f'install-{name}'
+
+
+def test_dir(name):
+    """Return the test directory path for a config: ``~/testing/install-<name>/test``."""
+    return install_dir(name) / 'test'
+
+
+def sbatch(args, script_body=None):
+    """Submit a job to Slurm via sbatch.
+
+    Args:
+        args: List of sbatch command-line arguments.
+        script_body: If provided, the bash script is piped to sbatch
+            via stdin instead of reading from a file.
+
+    Returns:
+        The Slurm job ID as a string.
+
+    Exits with error if sbatch fails.
+    """
+    result = subprocess.run(
+        ['sbatch'] + args,
+        input=script_body,
+        capture_output=True, text=True, cwd=str(TESTING_HOME))
+    if result.returncode != 0:
+        print(f"sbatch failed: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    m = re.search(r'(\d+)', result.stdout)
+    job_id = m.group(1) if m else '?'
+    return job_id
+
+
+def git_pull(branch=None):
+    """Pull the latest CHARMM source from origin.
+
+    Optionally checks out a specific branch first, then runs
+    ``git pull`` in `CHARMM_DIR`. Prints a warning and continues
+    if any git operation fails (e.g. network unreachable).
+
+    Args:
+        branch: If given, ``git checkout <branch>`` before pulling.
+    """
+    if not CHARMM_DIR.is_dir():
+        print(f"  Warning: {CHARMM_DIR} not found, skipping git pull",
+              file=sys.stderr)
+        return
+
+    if branch:
+        print(f"  Checking out branch: {branch}")
+        result = subprocess.run(
+            ['git', 'checkout', branch],
+            capture_output=True, text=True, cwd=str(CHARMM_DIR))
+        if result.returncode != 0:
+            print(f"  Error: git checkout failed: {result.stderr.strip()}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    print(f"  Pulling latest CHARMM source...")
+    result = subprocess.run(
+        ['git', 'pull'],
+        capture_output=True, text=True, cwd=str(CHARMM_DIR))
+    if result.returncode != 0:
+        print(f"  Warning: git pull failed: {result.stderr.strip()}",
+              file=sys.stderr)
+        print(f"  Continuing with current source.", file=sys.stderr)
+    else:
+        output = result.stdout.strip()
+        if 'Already up to date' in output:
+            print(f"  Already up to date.")
+        else:
+            lines = output.split('\n')
+            for line in lines[:3]:
+                print(f"  {line}")
+            if len(lines) > 3:
+                print(f"  ... ({len(lines) - 3} more lines)")
+
+
+# ─── Subcommands ───────────────────────────────────────────────────
+
+def cmd_list(args):
+    """Show all build/test configurations in a table.
+
+    Displays each config's name, whether it has a test suite,
+    the test.com arguments, a description, and the configure flags.
+    """
+    fmt = '{:<12} {:<6} {:<18} {}'
+    print(fmt.format('NAME', 'TEST', 'TEST_ARGS', 'DESCRIPTION'))
+    print('-' * 78)
+    for name in sorted(CONFIGS):
+        cfg = CONFIGS[name]
+        has_test = 'yes' if cfg.get('test', True) else 'no'
+        test_args = cfg.get('test_args', '-')
+        desc = cfg.get('description', cfg['configure'])
+        if len(desc) > 40:
+            desc = desc[:37] + '...'
+        print(fmt.format(name, has_test, test_args, desc))
+
+
+def cmd_build(args):
+    """Submit build jobs to Slurm.
+
+    For each config, submits a Slurm job that:
+
+    1. Activates the conda environment
+    2. Creates a CHARMM install tree if needed (via ``NewCharmmTree``)
+    3. Runs ``./configure`` with the config's flags
+    4. Builds with ``ninja install``
+
+    Before submitting, checks prerequisites (see `require_prereqs`) and
+    pulls the latest CHARMM source via ``git pull`` (see `git_pull`).
+    Use ``--no-pull`` to skip the pull step. Use ``--branch`` to check
+    out a specific branch before pulling.
+
+    Args:
+        args: Parsed CLI arguments with ``.names``, ``.no_pull``,
+            and ``.branch``.
+
+    Returns:
+        Dict mapping config name to Slurm job ID.
+    """
+    require_prereqs()
+
+    if not args.no_pull:
+        git_pull(branch=getattr(args, 'branch', None))
+        print()
+
+    names = resolve_names(args.names)
+    job_ids = {}
+
+    for name in names:
+        cfg = CONFIGS[name]
+        idir = install_dir(name)
+        idir.mkdir(parents=True, exist_ok=True)
+
+        sbatch_args = [
+            f'--job-name={name}-build',
+            f'--time={SLURM_BUILD_TIME}',
+            f'--partition={SLURM_PARTITION}',
+            '--nodes=1', '--ntasks-per-node=1',
+            f'--cpus-per-task={SLURM_BUILD_CPUS}',
+            f'--gres=gpu:{SLURM_DEFAULT_GPUS}',
+            f'--export=build_name={name},configure_arguments={cfg["configure"]}',
+            f'--output={idir}/%x-%j.out',
+        ]
+
+        job_id = sbatch(sbatch_args, script_body=BUILD_SCRIPT)
+        job_ids[name] = job_id
+        print(f"  {name:<12} build submitted  (job {job_id})")
+
+    return job_ids
+
+
+def cmd_test(args, dependencies=None):
+    """Submit test jobs to Slurm.
+
+    For each testable config, submits a Slurm job that runs
+    ``test.com`` with the appropriate MPI/thread/GPU parameters.
+
+    The Slurm resource requests (ntasks, cpus-per-task, gpus) are
+    derived automatically from the config's ``test_args`` string
+    via `parse_slurm_params`.
+
+    Args:
+        args: Parsed CLI arguments with ``.names``.
+        dependencies: Optional dict of {name: job_id} for Slurm
+            ``--dependency=afterok:`` chaining (used by `cmd_run`).
+
+    Returns:
+        Dict mapping config name to Slurm job ID.
+    """
+    if dependencies is None:
+        require_prereqs()
+
+    names = resolve_names(args.names, require_test=True)
+    job_ids = {}
+
+    for name in names:
+        cfg = CONFIGS[name]
+        test_type = cfg.get('test_type', 'test.com')
+        gpus = cfg.get('gpus', SLURM_DEFAULT_GPUS)
+
+        if test_type == 'pytest':
+            # pycharmm pytest — single-process, no MPI
+            script = PYTEST_SCRIPT
+            ntasks, cpus = 1, 1
+            export = f'test_name={name}'
+            outdir = install_dir(name) / 'tool' / 'pycharmm'
+            outdir.mkdir(parents=True, exist_ok=True)
+            output_path = f'{outdir}/%x-%j.out'
+            label = 'pytest'
+        else:
+            # Standard test.com
+            script = TEST_SCRIPT
+            test_args = cfg.get('test_args', 'cmake')
+            ntasks, cpus = parse_slurm_params(test_args)
+            export = f'test_name={name},test_args={test_args} output'
+            tdir = test_dir(name)
+            tdir.mkdir(parents=True, exist_ok=True)
+            output_path = f'{tdir}/%x-%j.out'
+            label = 'test'
+
+        sbatch_args = [
+            f'--job-name={name}-test',
+            f'--time={SLURM_TEST_TIME}',
+            f'--partition={SLURM_PARTITION}',
+            '--nodes=1',
+            f'--ntasks-per-node={ntasks}',
+            f'--cpus-per-task={cpus}',
+            f'--gres=gpu:{gpus}',
+            f'--export={export}',
+            f'--output={output_path}',
+        ]
+
+        if dependencies and name in dependencies:
+            sbatch_args.append(f'--dependency=afterok:{dependencies[name]}')
+
+        job_id = sbatch(sbatch_args, script_body=script)
+        job_ids[name] = job_id
+        dep_info = (f' (after job {dependencies[name]})'
+                    if dependencies and name in dependencies else '')
+        print(f"  {name:<12} {label:<6}submitted  (job {job_id}){dep_info}")
+
+    return job_ids
+
+
+def cmd_run(args):
+    """Submit build then test, chained via Slurm dependencies.
+
+    First submits build jobs for all requested configs (with a
+    ``git pull`` first), then submits test jobs with
+    ``--dependency=afterok:<build_job_id>`` so each test waits
+    for its corresponding build to complete successfully.
+
+    If a build job fails, its dependent test job will not run.
+    """
+    build_ids = cmd_build(args)
+    print()
+    cmd_test(args, dependencies=build_ids)
+
+
+def cmd_status(args):
+    """Show Slurm job status for charmm-test jobs.
+
+    Queries ``squeue`` and filters to only show jobs whose names
+    match known config names (e.g. ``gpu-build``, ``sccdftb-test``).
+    """
+    result = subprocess.run(
+        ['squeue', '--me', '--format=%.10i %.12j %.8T %.10M %.6D %R',
+         '--sort=j'],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"squeue failed: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    lines = result.stdout.strip().split('\n')
+    relevant = [lines[0]]  # header
+    for line in lines[1:]:
+        for name in CONFIGS:
+            if f'{name}-build' in line or f'{name}-test' in line:
+                relevant.append(line)
+                break
+
+    if len(relevant) == 1:
+        print("No active charmm-test jobs.")
+    else:
+        print('\n'.join(relevant))
+
+
+def cmd_bench(args):
+    """Promote test output to benchmark.
+
+    For each config, renames ``output/`` to ``bench/`` in the test
+    directory. If ``bench/`` already exists, it is backed up with
+    a timestamp suffix (e.g. ``bench.20260413-143022``).
+    """
+    names = resolve_names(args.names, require_test=True)
+
+    for name in names:
+        tdir = test_dir(name)
+        output = tdir / 'output'
+        bench = tdir / 'bench'
+
+        if not output.is_dir():
+            print(f"  {name:<12} {colored('SKIP', Color.SKIP)}"
+                  f" -- no output/ directory")
+            continue
+
+        if bench.is_dir():
+            backup = tdir / f'bench.{datetime.now():%Y%m%d-%H%M%S}'
+            bench.rename(backup)
+            print(f"  {name:<12} backed up bench -> {backup.name}")
+
+        output.rename(bench)
+        print(f"  {name:<12} {colored('OK', Color.PASS)} -- output/ -> bench/")
+
+
+def cmd_clean(args):
+    """Archive old test results.
+
+    Moves ``output/``, ``output.rpt``, ``test.log``, and ``compare.out``
+    into a timestamped ``archive-YYYYMMDD-HHMMSS/`` directory within
+    each config's test directory.
+    """
+    names = resolve_names(args.names, require_test=True)
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+
+    for name in names:
+        tdir = test_dir(name)
+        if not tdir.is_dir():
+            continue
+
+        archive = tdir / f'archive-{timestamp}'
+        moved = []
+
+        for item in ('output', 'output.rpt', 'test.log', 'compare.out'):
+            src = tdir / item
+            if src.exists():
+                archive.mkdir(parents=True, exist_ok=True)
+                src.rename(archive / item)
+                moved.append(item)
+
+        if moved:
+            print(f"  {name:<12} archived: {', '.join(moved)}")
+        else:
+            print(f"  {name:<12} nothing to clean")
+
+
+def check_prereqs(verbose=False):
+    """Verify that all prerequisites for the testing pipeline are in place.
+
+    When called with ``verbose=True`` (by the ``prereqs`` subcommand),
+    prints a detailed checklist. When called with ``verbose=False``
+    (by ``build``, ``test``, ``run``), runs silently and returns a list
+    of failure messages for anything missing.
+
+    Returns:
+        List of failure message strings. Empty list means all checks passed.
+    """
+    failures = []
+
+    def check(condition, label, hint=''):
+        if verbose:
+            if condition:
+                print(f"  {colored('OK', Color.PASS)}    {label}")
+            else:
+                print(f"  {colored('MISS', Color.FAIL)}  {label}")
+                if hint:
+                    print(f"         {Color.DIM}{hint}{Color.RESET}")
+        if not condition:
+            failures.append(f"{label} -- {hint}" if hint else label)
+
+    def warn(condition, label, hint=''):
+        if verbose:
+            if condition:
+                print(f"  {colored('OK', Color.PASS)}    {label}")
+            else:
+                print(f"  {colored('WARN', Color.SKIP)}  {label}")
+                if hint:
+                    print(f"         {Color.DIM}{hint}{Color.RESET}")
+
+    def has_cmd(name):
+        return shutil.which(name) is not None
+
+    if verbose:
+        print("Checking prerequisites:\n")
+
+    # Directories
+    check(TESTING_HOME.is_dir(),
+          f"Testing home: {TESTING_HOME}",
+          f"mkdir -p {TESTING_HOME}")
+
+    check(CHARMM_DIR.is_dir(),
+          f"CHARMM source: {CHARMM_DIR}",
+          f"git clone <charmm-repo> {CHARMM_DIR}")
+
+    if CHARMM_DIR.is_dir():
+        check((CHARMM_DIR / '.git').is_dir(),
+              "CHARMM is a git repo",
+              "The charmm/ directory must be a git clone")
+        check((CHARMM_DIR / 'tool' / 'NewCharmmTree').exists(),
+              "NewCharmmTree script present",
+              "CHARMM source may be incomplete")
+
+    check(CONDA_ENV.is_dir(),
+          f"Conda environment: {CONDA_ENV}",
+          "Run setup.bash to create it")
+
+    warn((TESTING_HOME / 'sccdftb_data' / 'sccdftb.dat').is_file(),
+         "SCCDFTB data: sccdftb_data/sccdftb.dat",
+         "Only needed for the sccdftb config")
+
+    if verbose:
+        print()
+
+    # Commands
+    check(has_cmd('sbatch'),
+          "sbatch (Slurm job submission)",
+          "Must run on a Slurm cluster login node")
+
+    check(has_cmd('squeue'),
+          "squeue (Slurm job status)",
+          "Must run on a Slurm cluster login node")
+
+    check(has_cmd('git'),
+          "git",
+          "Install via package manager")
+
+    warn(has_cmd('ninja'),
+         "ninja (build tool)",
+         "Should be in the conda env; needed on compute nodes")
+
+    warn(has_cmd('cmake'),
+         "cmake",
+         "Should be in the conda env; needed on compute nodes")
+
+    check(Path('/usr/bin/tcsh').is_file(),
+          "/usr/bin/tcsh (for test.com)",
+          "Install: sudo dnf install tcsh")
+
+    if verbose:
+        print()
+        if not failures:
+            print(colored("  All required prerequisites met.", Color.PASS))
+        else:
+            print(colored("  Some prerequisites are missing (see above).",
+                           Color.FAIL))
+
+    return failures
+
+
+def require_prereqs():
+    """Check prerequisites and exit with details if any are missing.
+
+    Called at the start of ``build``, ``test``, and ``run`` to fail
+    early with actionable messages instead of cryptic sbatch errors.
+    """
+    failures = check_prereqs(verbose=False)
+    if failures:
+        print("Prerequisites not met:", file=sys.stderr)
+        for msg in failures:
+            print(f"  - {msg}", file=sys.stderr)
+        print(f"\nRun 'charmm-test prereqs' for full details.",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_prereqs(args):
+    """Check that all prerequisites for the testing pipeline are in place.
+
+    Verifies:
+
+    - `TESTING_HOME` directory exists
+    - CHARMM source repo exists and is a git repository
+    - Conda environment exists
+    - Required commands are available (sbatch, squeue, git, ninja, cmake, tcsh)
+    - sccdftb data directory exists (optional, warns if missing)
+    """
+    failures = check_prereqs(verbose=True)
+    return len(failures) == 0
+
+
+# ─── Numerical comparison (ported from compare.awk) ───────────────
+
+def parse_number(s):
+    """Convert a string to float, handling Fortran D-notation.
+
+    Fortran output may use ``D`` instead of ``E`` for exponents
+    (e.g. ``1.234D-05``). This function normalizes those to standard
+    Python float notation.
+
+    Returns the absolute value (matching compare.awk's
+    ``abs(tolower(field)+0)``), or None for non-numeric strings.
+    """
+    try:
+        return abs(float(s.replace('D-', 'E-').replace('D+', 'E+')
+                          .replace('d-', 'e-').replace('d+', 'e+')))
+    except (ValueError, AttributeError):
+        return None
+
+
+def is_expected_diff(old_fields, new_fields):
+    """Check if a diff line pair is an expected/ignorable difference.
+
+    Ported from ``compare.awk``'s exclusion patterns. These cover
+    lines whose content is expected to vary between runs:
+
+    - Memory addresses and allocation (``MAXIMUM SPACE``, ``ADDRESS:``,
+      ``CONTROL ARRAY``)
+    - Platform-dependent values (``>>TESTENDIAN``, ``FORCE=``, ``VCLOSE:``)
+    - Correlation coefficients (variable precision)
+    - Pair counts from parallel decomposition (``GROUP PAIRS``,
+      ``ATOM PAIRS``, etc.)
+    - Version/build number fields
+    - MKIMAT vs MKIMAT2 renaming (all fields match except the last)
+
+    Args:
+        old_fields: Whitespace-split words from the benchmark (``<``) line.
+        new_fields: Whitespace-split words from the test output (``>``) line.
+
+    Returns:
+        True if this difference should be ignored.
+    """
+    def f(fields, i):
+        return fields[i] if i < len(fields) else ''
+
+    for fields in (old_fields, new_fields):
+        if f(fields, 0) == 'MAXIMUM' and f(fields, 1) == 'SPACE':
+            return True
+        if f(fields, 1) == 'ADDRESS:':
+            return True
+        if f(fields, 0) == 'CONTROL' and f(fields, 1) == 'ARRAY':
+            return True
+        if f(fields, 0) == '>>TESTENDIAN':
+            return True
+        if f(fields, 0) == 'Number':
+            return True
+        if f(fields, 0) == 'FORCE=':
+            return True
+        if f(fields, 0) == 'VCLOSE:':
+            return True
+        if f(fields, 0) == 'CORR.' and f(fields, 1) == 'COEFFICIENT':
+            return True
+        if f(fields, 1) == 'GROUP' and f(fields, 2) == 'PAIRS':
+            return True
+        if f(fields, 1) == 'PAIRS' and f(fields, 2) == 'USED':
+            return True
+        if f(fields, 1) == 'ATOM' and f(fields, 2) == 'PAIRS':
+            return True
+        if f(fields, 3) == 'ATOM' and f(fields, 4) == 'PAIRS':
+            return True
+        if f(fields, 3) == 'atom' and f(fields, 4) == 'pairs':
+            return True
+        if f(fields, 3) == 'group' and f(fields, 4) == 'pairs':
+            return True
+        for i in (4, 5, 6):
+            if f(fields, i) in ('99', '5'):
+                return True
+
+    if (f(old_fields, 2) == 'has' and f(new_fields, 2) == 'has'
+            and f(old_fields, 0) == f(new_fields, 0)
+            and f(old_fields, 1) == f(new_fields, 1)
+            and f(old_fields, 3) == f(new_fields, 3)
+            and f(old_fields, 4) == f(new_fields, 4)
+            and f(old_fields, 5) == f(new_fields, 5)):
+        return True
+
+    return False
+
+
+def compare_line_pair(old_fields, new_fields, tol):
+    """Compare two whitespace-split lines field-by-field with tolerance.
+
+    Matches ``compare.awk`` behavior: non-numeric strings become 0.0
+    (awk's ``string+0`` coercion), so only fields where both or either
+    side is numeric are meaningfully compared.
+
+    The tolerance check uses relative error::
+
+        if max(|a|, |b|) > tol^2:
+            error = |a - b| / max(|a|, |b|)
+        else:
+            error = |a - b|
+        fail if error > tol and max(|a|, |b|) > tol
+
+    Args:
+        old_fields: Whitespace-split words from benchmark line.
+        new_fields: Whitespace-split words from test output line.
+        tol: Numerical tolerance (e.g. 0.0001).
+
+    Returns:
+        True if lines are equivalent within tolerance.
+    """
+    if is_expected_diff(old_fields, new_fields):
+        return True
+
+    n = min(len(old_fields), len(new_fields))
+    for i in range(n):
+        a_raw = parse_number(old_fields[i])
+        b_raw = parse_number(new_fields[i])
+        a = a_raw if a_raw is not None else 0.0
+        b = b_raw if b_raw is not None else 0.0
+
+        diff = abs(a - b)
+        denom = max(a, b)
+        if denom > tol * tol:
+            diff /= denom
+        if diff > tol and denom > tol:
+            return False
+
+    return True
+
+
+def compare_hunk(old_lines, new_lines, tol):
+    """Compare a diff hunk (paired old/new line groups).
+
+    A hunk comes from a single diff block in ``output.rpt``: the ``<``
+    lines (benchmark) and ``>`` lines (test output) between diff
+    coordinate headers.
+
+    Lines are paired positionally and compared via `compare_line_pair`.
+    Unmatched lines (when counts differ) are always failures.
+
+    Args:
+        old_lines: List of benchmark content lines (``<`` prefix stripped).
+        new_lines: List of test output content lines (``>`` prefix stripped).
+        tol: Numerical tolerance.
+
+    Returns:
+        Tuple of (passed, bad_pairs) where bad_pairs is a list of
+        ``(old_line, new_line)`` tuples that failed comparison.
+    """
+    n = min(len(old_lines), len(new_lines))
+    bad_pairs = []
+
+    for i in range(n):
+        of = old_lines[i].split()
+        nf = new_lines[i].split()
+        if not compare_line_pair(of, nf, tol):
+            bad_pairs.append((old_lines[i], new_lines[i]))
+
+    if len(old_lines) != len(new_lines):
+        for line in old_lines[n:]:
+            bad_pairs.append((line, ''))
+        for line in new_lines[n:]:
+            bad_pairs.append(('', line))
+
+    return len(bad_pairs) == 0, bad_pairs
+
+
+# ─── RPT parsing ──────────────────────────────────────────────────
+
+RPT_HEADER = re.compile(r'<\*\*\s+(\S+)\s+:\s+(\S+)\s+\*\*>(.*)')
+"""Regex matching test headers in output.rpt.
+
+Format: ``<** c47test : testname **> Wed Apr 13 14:30:22 CDT 2026``
+
+Groups: (1) suite name, (2) test name, (3) remainder (timestamp).
+"""
+
+NOISE_PATTERNS = ('Parallel load', 'New timer')
+"""Diff line content patterns that are always ignored.
+
+These appear in diff output due to runtime-dependent messages
+and are not meaningful test differences.
+"""
+
+
+def parse_rpt(rpt_file):
+    """Parse ``output.rpt`` into per-test diff data.
+
+    ``output.rpt`` is produced by ``test.com``: for each test, it writes
+    a header line followed by the raw ``diff`` output between sed-filtered
+    benchmark and test output files.
+
+    Diff blocks are parsed into hunks (groups of ``<`` and ``>`` lines
+    separated by ``---`` or diff coordinate lines). Lines matching
+    `NOISE_PATTERNS` are silently dropped.
+
+    Args:
+        rpt_file: Path to output.rpt.
+
+    Returns:
+        Dict mapping test names to::
+
+            {'suite': str, 'hunks': [(old_lines, new_lines), ...]}
+
+        where each hunk is a pair of string lists.
+    """
+    tests = {}
+    current_name = None
+    current_suite = None
+    old_buf = []
+    new_buf = []
+    hunks = []
+
+    def flush_hunk():
+        nonlocal old_buf, new_buf
+        if old_buf or new_buf:
+            hunks.append((old_buf, new_buf))
+            old_buf, new_buf = [], []
+
+    def flush_test():
+        nonlocal hunks
+        flush_hunk()
+        if current_name is not None:
+            tests[current_name] = {'suite': current_suite, 'hunks': hunks}
+            hunks = []
+
+    lines = []
+    if rpt_file.is_file():
+        with open(rpt_file, encoding='utf-8', errors='replace') as fh:
+            lines = fh.readlines()
+
+    for line in lines:
+        line = line.rstrip('\n')
+        m = RPT_HEADER.match(line)
+        if m:
+            flush_test()
+            current_suite = m.group(1)
+            current_name = m.group(2)
+            continue
+
+        if line.startswith('< '):
+            content = line[2:]
+            if not any(p in content for p in NOISE_PATTERNS):
+                old_buf.append(content)
+        elif line.startswith('> '):
+            content = line[2:]
+            if not any(p in content for p in NOISE_PATTERNS):
+                new_buf.append(content)
+        elif line.strip() == '---':
+            pass
+        else:
+            flush_hunk()
+
+    flush_test()
+    return tests
+
+
+# ─── Output file analysis ─────────────────────────────────────────
+
+def read_lines(filepath):
+    """Read all lines from a file, returning empty list if missing."""
+    try:
+        with open(filepath, encoding='utf-8', errors='replace') as fh:
+            return fh.readlines()
+    except FileNotFoundError:
+        return []
+
+
+def grep_output(lines, pattern):
+    """Search lines for a pattern, excluding echo and comment lines.
+
+    This prevents matching CHARMM input script echo statements
+    (which echo the test checking commands) or Fortran comments.
+
+    Args:
+        lines: List of text lines to search.
+        pattern: Substring to match.
+
+    Returns:
+        List of stripped matching lines.
+    """
+    matches = []
+    for line in lines:
+        if pattern in line:
+            lower = line.strip().casefold()
+            if 'echo' not in lower and not lower.startswith('!'):
+                matches.append(line.strip())
+    return matches
+
+
+def get_elapsed_time(lines):
+    """Extract ELAPSED TIME from CHARMM test output.
+
+    Searches from the end of the file for the last ``ELAPSED TIME:``
+    line, which CHARMM prints at normal termination.
+
+    Returns:
+        Elapsed time in seconds, or 0.0 if not found.
+    """
+    for line in reversed(lines):
+        if 'ELAPSED TIME:' in line:
+            try:
+                return float(line.split()[-2])
+            except (ValueError, IndexError):
+                pass
+    return 0.0
+
+
+# ─── Grade subcommand ─────────────────────────────────────────────
+
+def cmd_grade(args):
+    """Grade test results with numerical tolerance comparison.
+
+    For each config, examines all ``.out`` files in the ``output/``
+    directory and grades them through a cascade of checks:
+
+    1. **xfail list**: If the test name appears in the xfail file,
+       it is marked as skipped (expected failure).
+    2. **Missing output**: No ``.out`` file -> error.
+    3. **ABNORMAL TERMINATION**: CHARMM crashed -> error.
+    4. **No TERMINATION line**: CHARMM didn't finish -> error.
+    5. **Self-reported FAIL**: ``RESULT: FAIL`` in output -> failure.
+    6. **Self-reported SKIP**: ``TESTCASE RESULT: SKIP`` or
+       ``TEST NOT PERFORMED`` -> skipped.
+    7. **Self-reported PASS**: ``TESTCASE RESULT: PASS`` -> passed.
+    8. **Diff comparison**: Parse ``output.rpt`` and compare
+       field-by-field with numerical tolerance via `compare_hunk`.
+       If no diffs or all within tolerance -> passed.
+
+    Output is color-coded to the terminal. Use ``--xml`` to also
+    write JUnit XML (e.g. for Jenkins integration).
+    """
+    names = resolve_names(args.names, require_test=True)
+    tol = args.tol
+
+    xfail = set()
+    if args.xfail and Path(args.xfail).is_file():
+        with open(args.xfail) as fh:
+            xfail = {line.strip() for line in fh
+                     if line.strip() and not line.startswith('#')}
+
+    results = []
+    n_pass = n_fail = n_error = n_skip = 0
+
+    for name in names:
+        tdir = test_dir(name)
+        if not tdir.is_dir():
+            print(f"  {name:<12} {colored('SKIP', Color.SKIP)}"
+                  f" -- no test directory")
+            n_skip += 1
+            results.append((name, 'skipped', 'no test directory', 0.0))
+            continue
+
+        output_dir = tdir / 'output'
+        rpt_file = tdir / 'output.rpt'
+
+        if not output_dir.is_dir():
+            print(f"  {name:<12} {colored('SKIP', Color.SKIP)}"
+                  f" -- no output/ directory")
+            n_skip += 1
+            results.append((name, 'skipped', 'no output directory', 0.0))
+            continue
+
+        test_names = sorted(
+            f.stem for f in output_dir.iterdir()
+            if f.suffix == '.out'
+        )
+
+        if not test_names:
+            print(f"  {name:<12} {colored('SKIP', Color.SKIP)}"
+                  f" -- no .out files")
+            n_skip += 1
+            results.append((name, 'skipped', 'no output files', 0.0))
+            continue
+
+        rpt = parse_rpt(rpt_file)
+
+        config_fails = []
+        config_errors = []
+        config_skips = []
+        config_pass = 0
+
+        for tname in test_names:
+            out_file = output_dir / f'{tname}.out'
+            lines = read_lines(out_file)
+            elapsed = get_elapsed_time(lines)
+
+            if tname in xfail:
+                config_skips.append(tname)
+                continue
+
+            if not lines:
+                config_errors.append((tname, 'NO OUTPUT FILE'))
+                continue
+
+            abnormal = grep_output(lines, 'ABNORMAL TERMINATION')
+            if abnormal:
+                config_errors.append((tname, abnormal[0]))
+                continue
+
+            if not grep_output(lines, 'TERMINATION'):
+                config_errors.append((tname, 'NO TERMINATION'))
+                continue
+
+            fail_result = grep_output(lines, 'RESULT: FAIL')
+            if fail_result:
+                config_fails.append((tname, fail_result[0]))
+                continue
+
+            skips = (grep_output(lines, 'TESTCASE RESULT: SKIP') +
+                     grep_output(lines, 'TEST NOT PERFORMED') +
+                     grep_output(lines, 'test not performed'))
+            if skips:
+                config_skips.append(tname)
+                continue
+
+            if grep_output(lines, 'TESTCASE RESULT: PASS'):
+                config_pass += 1
+                continue
+
+            # Diff comparison
+            rpt_data = rpt.get(tname)
+            if rpt_data and rpt_data['hunks']:
+                all_bad = []
+                for old_lines, new_lines in rpt_data['hunks']:
+                    passed, bad_pairs = compare_hunk(old_lines, new_lines, tol)
+                    if not passed:
+                        all_bad.extend(bad_pairs)
+                if all_bad:
+                    detail = (f'{len(all_bad)} numerical diff(s) '
+                              f'exceed tol={tol}')
+                    config_fails.append((tname, detail))
+                    continue
+
+            config_pass += 1
+
+        # Print summary line for this config
+        total = len(test_names)
+        if config_errors:
+            status_str = colored('ERROR', Color.ERROR)
+            n_error += 1
+        elif config_fails:
+            status_str = colored('FAIL', Color.FAIL)
+            n_fail += 1
+        elif config_skips and config_pass == 0:
+            status_str = colored('SKIP', Color.SKIP)
+            n_skip += 1
+        else:
+            status_str = colored('PASS', Color.PASS)
+            n_pass += 1
+
+        counts = f'{config_pass}/{total} passed'
+        if config_fails:
+            counts += f', {len(config_fails)} failed'
+        if config_errors:
+            counts += f', {len(config_errors)} errors'
+        if config_skips:
+            counts += f', {len(config_skips)} skipped'
+
+        print(f"  {name:<12} {status_str:>20}  {counts}")
+
+        if not args.quiet:
+            for tname, msg in config_errors[:5]:
+                print(f"               {colored('ERROR', Color.ERROR)}"
+                      f" {tname}: {msg}")
+            for tname, msg in config_fails[:5]:
+                print(f"               {colored('FAIL', Color.FAIL)}"
+                      f"  {tname}: {msg}")
+            remaining = len(config_errors[5:]) + len(config_fails[5:])
+            if remaining:
+                print(f"               ... and {remaining} more")
+
+        # Collect per-test results for XML
+        for tname in test_names:
+            out_file = output_dir / f'{tname}.out'
+            lines = read_lines(out_file)
+            elapsed = get_elapsed_time(lines)
+            if tname in [t for t, _ in config_errors]:
+                msg = next(m for t, m in config_errors if t == tname)
+                results.append((f'{name}/{tname}', 'error', msg, elapsed))
+            elif tname in [t for t, _ in config_fails]:
+                msg = next(m for t, m in config_fails if t == tname)
+                results.append((f'{name}/{tname}', 'failure', msg, elapsed))
+            elif tname in config_skips:
+                results.append(
+                    (f'{name}/{tname}', 'skipped', 'skipped', elapsed))
+            else:
+                results.append((f'{name}/{tname}', None, '', elapsed))
+
+    # Overall summary
+    total_configs = n_pass + n_fail + n_error + n_skip
+    print(f"\n  {Color.BOLD}{total_configs} configs: "
+          f"{colored(f'{n_pass} passed', Color.PASS)}, "
+          f"{colored(f'{n_fail} failed', Color.FAIL)}, "
+          f"{colored(f'{n_error} errors', Color.ERROR)}, "
+          f"{colored(f'{n_skip} skipped', Color.SKIP)}{Color.RESET}")
+
+    if args.xml:
+        generate_junit(results, args.xml)
+        print(f"\n  JUnit XML written to {args.xml}")
+
+
+def generate_junit(results, output_path):
+    """Generate JUnit XML from graded test results.
+
+    Produces a ``<testsuites>`` document with one ``<testsuite>`` per
+    config and one ``<testcase>`` per individual test. Compatible with
+    Jenkins JUnit plugin.
+
+    Args:
+        results: List of ``(full_name, status, message, elapsed)`` tuples.
+            ``full_name`` is ``config/testname``, ``status`` is
+            ``'error'``, ``'failure'``, ``'skipped'``, or None (passed).
+        output_path: File path to write the XML to.
+    """
+    testsuites = ET.Element('testsuites')
+
+    suites = {}
+    for full_name, status, message, elapsed in results:
+        parts = full_name.split('/', 1)
+        suite_name = parts[0]
+        test_name = parts[1] if len(parts) > 1 else parts[0]
+
+        tc = ET.Element('testcase', name=test_name, time=f'{elapsed:.3f}')
+        if status and message:
+            child = ET.SubElement(tc, status)
+            child.text = message
+        suites.setdefault(suite_name, []).append(tc)
+
+    for suite_name in sorted(suites):
+        cases = sorted(suites[suite_name], key=lambda tc: tc.get('name'))
+        n = len(cases)
+        n_err = sum(1 for tc in cases if tc.find('error') is not None)
+        n_fail = sum(1 for tc in cases if tc.find('failure') is not None)
+        n_skip = sum(1 for tc in cases if tc.find('skipped') is not None)
+        total_t = sum(float(tc.get('time', 0)) for tc in cases)
+
+        ts = ET.SubElement(testsuites, 'testsuite',
+                           name=suite_name, tests=str(n),
+                           errors=str(n_err), failures=str(n_fail),
+                           skipped=str(n_skip), time=f'{total_t:.3f}')
+        for tc in cases:
+            ts.append(tc)
+
+    ET.indent(testsuites, space='  ')
+    with open(output_path, 'w') as fh:
+        fh.write('<?xml version="1.0" encoding="utf-8"?>\n')
+        fh.write(ET.tostring(testsuites, encoding='unicode'))
+        fh.write('\n')
+
+
+# ─── Main ──────────────────────────────────────────────────────────
+
+def main():
+    """Entry point. Parses CLI arguments and dispatches to subcommands."""
+    if not sys.stdout.isatty():
+        Color.disable()
+
+    parser = argparse.ArgumentParser(
+        prog='charmm-test',
+        description='Unified CLI for CHARMM Slurm build/test/grade pipeline.',
+        epilog='Run "charmm-test prereqs" to verify your environment.')
+    sub = parser.add_subparsers(dest='command')
+
+    # list
+    sub.add_parser('list', help='show all configurations')
+
+    # build
+    p = sub.add_parser('build', help='submit build jobs')
+    p.add_argument('names', nargs='*', help='config names (default: all)')
+    p.add_argument('--branch', help='git branch to check out before building')
+    p.add_argument('--no-pull', action='store_true',
+                   help='skip git pull before building')
+
+    # test
+    p = sub.add_parser('test', help='submit test jobs')
+    p.add_argument('names', nargs='*', help='config names (default: all)')
+
+    # run (build + test chained)
+    p = sub.add_parser('run',
+                       help='build then test (chained via Slurm deps)')
+    p.add_argument('names', nargs='*', help='config names (default: all)')
+    p.add_argument('--branch', help='git branch to check out before building')
+    p.add_argument('--no-pull', action='store_true',
+                   help='skip git pull before building')
+
+    # grade
+    p = sub.add_parser('grade', help='grade test results')
+    p.add_argument('names', nargs='*', help='config names (default: all)')
+    p.add_argument('--tol', type=float, default=DEFAULT_TOL,
+                   help=f'numerical tolerance (default: {DEFAULT_TOL})')
+    p.add_argument('--xfail',
+                   help='file listing expected-failure test names')
+    p.add_argument('--xml', help='write JUnit XML to this file')
+    p.add_argument('--quiet', action='store_true',
+                   help='suppress failure details')
+
+    # status
+    sub.add_parser('status', help='show Slurm job status')
+
+    # bench
+    p = sub.add_parser('bench', help='promote output to benchmark')
+    p.add_argument('names', nargs='*', help='config names (default: all)')
+
+    # clean
+    p = sub.add_parser('clean', help='archive old test results')
+    p.add_argument('names', nargs='*', help='config names (default: all)')
+
+    # prereqs
+    sub.add_parser('prereqs',
+                   help='check prerequisites (dirs, commands, env)')
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    {
+        'list': cmd_list,
+        'build': cmd_build,
+        'test': cmd_test,
+        'run': cmd_run,
+        'grade': cmd_grade,
+        'status': cmd_status,
+        'bench': cmd_bench,
+        'clean': cmd_clean,
+        'prereqs': cmd_prereqs,
+    }[args.command](args)
+
+
+if __name__ == '__main__':
+    main()

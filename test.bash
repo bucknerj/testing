@@ -1,27 +1,26 @@
 #!/bin/bash
-#SBATCH --time=4:00:00
-#SBATCH -p ada5000
 #SBATCH --nodes=1
+set -euo pipefail
 
-echo "BEGIN TEST SCRIPT $(date)"
+# Slurm exports: test_name, test_args (includes 'output' as last arg)
+# Time, partition, ntasks, cpus, gpus, output set by charmm-test
 
-echo "DETECTED: test name ->${test_name}<-"
-echo "DETECTED: test args ->${test_args}<-"
+echo "=== TEST ${test_name} === $(date)"
+echo "test_args: ${test_args}"
 
 module load anaconda/miniconda-latest
 eval "$(conda shell.bash hook)"
 conda activate "$HOME/testing/env/test"
 
-pushd "$HOME/testing/install-$test_name/test"
+cd "$HOME/testing/install-${test_name}/test"
 
+# Link sccdftb data if needed
 if [[ "${test_name}" == "sccdftb" ]] && [[ ! -L "./sccdftb.dat" ]]; then
-  ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat
+    ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat
 fi
 
-/usr/bin/tcsh ./test.com ${test_args} | tee "test.log" || true
+# Run test suite — test.com produces output.rpt for grading
+# Grading is done separately by: charmm-test grade
+/usr/bin/tcsh ./test.com ${test_args} 2>&1 | tee test.log || true
 
-if [[ -d "./bench" ]]; then
-  awk -f compare.awk -v verbose=1 -v tol=0.0001 output.rpt > compare.out
-fi
-
-echo "END TEST SCRIPT $(date)"
+echo "=== TEST ${test_name} DONE === $(date)"

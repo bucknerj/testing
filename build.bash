@@ -1,42 +1,29 @@
 #!/bin/bash
-#SBATCH --time=4:00:00
-#SBATCH -p ada5000
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
+set -euo pipefail
 
-SLURM_NTASKS=4
+# Slurm exports: build_name, configure_arguments
+# Time, partition, cpus, gpus, output set by charmm-test
 
-echo "BEGIN BUILD SCRIPT $(date)"
-
-echo "DETECTED: build name ->${build_name}<-"
-echo "DETECTED: configure arguments ->${configure_arguments}<-"
+echo "=== BUILD ${build_name} === $(date)"
+echo "configure: ${configure_arguments}"
 
 module load anaconda/miniconda-latest
 eval "$(conda shell.bash hook)"
 conda activate "$HOME/testing/env/test"
 
-pushd "$HOME/testing"
+cd "$HOME/testing"
 
-if [[ ! -d "install-$build_name" ]]; then
-  echo "creating new charmm tree install-$build_name"
-  charmm/tool/NewCharmmTree "install-$build_name"
+if [[ ! -d "install-${build_name}" ]]; then
+    echo "Creating new CHARMM tree: install-${build_name}"
+    charmm/tool/NewCharmmTree "install-${build_name}"
 fi
 
-if [[ -d "install-$build_name/build/cmake" ]]; then
-  echo "removing previous build dir install-$build_name/build/cmake"
-  rm -rf install-$build_name/build/cmake;
-fi
+rm -rf "install-${build_name}/build/cmake"
 
-pushd "install-$build_name"
+cd "install-${build_name}"
+./configure --with-ninja ${configure_arguments}
+ninja -j${SLURM_CPUS_PER_TASK:-4} -Cbuild/cmake install
 
-echo "start configure script..."
-./configure --with-ninja $configure_arguments
-echo "... configure script finished"
-
-echo "begin compile using ninja..."
-ninja -j$SLURM_NTASKS -Cbuild/cmake install
-echo "... finished with ninja"
-
-echo "END BUILD SCRIPT $(date)"
+echo "=== BUILD ${build_name} DONE === $(date)"

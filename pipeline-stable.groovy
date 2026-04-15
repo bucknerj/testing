@@ -64,7 +64,10 @@ pipeline {
                         ${ENV_SETUP}
                         python \${WORKSPACE}/testing/charmm-test list --json
                     """, returnStdout: true).trim()
-                    charmmConfigs = new groovy.json.JsonSlurper().parseText(json)
+                    def parsed = new groovy.json.JsonSlurper().parseText(json)
+                    // Convert LazyMap to HashMap for Jenkins CPS serialization
+                    charmmConfigs = new HashMap(parsed)
+                    charmmConfigs.each { k, v -> charmmConfigs[k] = new HashMap(v) }
                     echo "Loaded ${charmmConfigs.size()} configurations: ${charmmConfigs.keySet().sort().join(', ')}"
                 }
             }

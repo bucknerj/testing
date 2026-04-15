@@ -1,7 +1,7 @@
 // Resource limits — morrison has 16 cores; reserve 4 for desktop use
 def MAX_BUILD_CONCURRENT = 2   // concurrent ninja builds
 def BUILD_THREADS = 6          // -j per build (2 × 6 = 12 cores)
-def MAX_TEST_CONCURRENT = 3    // concurrent test runs
+def MAX_TEST_CONCURRENT = 4    // concurrent test runs
 
 // Run a map of closures in batches of the given size
 def runInBatches(Map jobs, int batchSize) {
@@ -64,7 +64,7 @@ def intelTransform(Map configs) {
 pipeline {
     agent any
     options {
-        timeout(time: 4, unit: 'HOURS')
+        timeout(time: 6, unit: 'HOURS')
         timestamps()
     }
     stages {

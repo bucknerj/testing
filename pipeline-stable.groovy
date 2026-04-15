@@ -64,7 +64,7 @@ pipeline {
                         ${ENV_SETUP}
                         python \${WORKSPACE}/testing/charmm-test list --json
                     """, returnStdout: true).trim()
-                    charmmConfigs = readJSON text: json
+                    charmmConfigs = new groovy.json.JsonSlurper().parseText(json)
                     echo "Loaded ${charmmConfigs.size()} configurations: ${charmmConfigs.keySet().sort().join(', ')}"
                 }
             }

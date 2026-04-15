@@ -103,8 +103,11 @@ from pathlib import Path
 
 # ─── Configuration ─────────────────────────────────────────────────
 
-TESTING_HOME = Path.home() / 'testing'
-"""Root directory for the testing pipeline. All paths are relative to this."""
+TESTING_HOME = Path(os.environ.get('CHARMM_TEST_HOME', Path.home() / 'testing'))
+"""Root directory for the testing pipeline. All paths are relative to this.
+
+Override via the ``CHARMM_TEST_HOME`` environment variable (e.g. for Jenkins
+workspaces where install-* trees live under ``$WORKSPACE``)."""
 
 CHARMM_DIR = TESTING_HOME / 'charmm'
 """Path to the CHARMM source repository (git clone)."""
@@ -190,15 +193,15 @@ CONFIGS = {
         'test_args': 'M 8 X 2 cmake',
         'description': 'String method (8 MPI ranks)',
     },
+    'resize': {
+        'configure': f'-a RESIZE {PIP_LOCK}',
+        'test_args': 'M 2 X 2 cmake',
+        'description': 'RESIZE dynamic memory reallocation tests',
+    },
     'tamd': {
         'configure': f'--without-mpi -a TAMD {PIP_LOCK}',
         'test_args': 'cmake',
         'description': 'Temperature-accelerated MD (serial, no MPI)',
-    },
-    'pycharmm': {
-        'configure': f'--with-fftdock {PIP_LOCK}',
-        'test_type': 'pytest',
-        'description': 'pyCHARMM Python interface (pytest)',
     },
 }
 """Build/test configurations.
@@ -400,24 +403,27 @@ def parse_slurm_params(test_args):
     return ntasks, cpus
 
 
-def resolve_names(args_names, require_test=False):
+def resolve_names(args_names, require_test=False, strict=True):
     """Resolve config names from CLI arguments, defaulting to all.
 
     Args:
         args_names: List of config names from argparse, or empty for all.
         require_test: If True, filter out build-only configs (test=False).
+        strict: If True (default), exit on unknown names. If False, accept
+            any name — useful for grading, which only needs directory paths.
 
     Returns:
         Sorted list of valid config names.
 
-    Exits with error if any name is not in `CONFIGS`.
+    Exits with error if any name is not in `CONFIGS` (when strict=True).
     """
     if args_names:
-        unknown = [n for n in args_names if n not in CONFIGS]
-        if unknown:
-            print(f"Unknown config(s): {', '.join(unknown)}", file=sys.stderr)
-            print(f"Available: {', '.join(sorted(CONFIGS))}", file=sys.stderr)
-            sys.exit(1)
+        if strict:
+            unknown = [n for n in args_names if n not in CONFIGS]
+            if unknown:
+                print(f"Unknown config(s): {', '.join(unknown)}", file=sys.stderr)
+                print(f"Available: {', '.join(sorted(CONFIGS))}", file=sys.stderr)
+                sys.exit(1)
         names = args_names
     else:
         names = sorted(CONFIGS)
@@ -510,11 +516,34 @@ def git_pull(branch=None):
 # ─── Subcommands ───────────────────────────────────────────────────
 
 def cmd_list(args):
-    """Show all build/test configurations in a table.
+    """Show all build/test configurations.
 
-    Displays each config's name, whether it has a test suite,
-    the test.com arguments, a description, and the configure flags.
+    With ``--json``, outputs machine-readable JSON for consumption by
+    Jenkins pipelines or other tools. Without it, prints a human-readable
+    table.
+
+    The JSON output includes all fields from `CONFIGS` plus the config
+    name, suitable for driving automated build/test/grade pipelines.
     """
+    if args.json:
+        import json
+        out = {}
+        for name in sorted(CONFIGS):
+            cfg = CONFIGS[name]
+            out[name] = {
+                'configure': cfg['configure'],
+                'test': cfg.get('test', True),
+                'description': cfg.get('description', ''),
+            }
+            if 'test_args' in cfg:
+                out[name]['test_args'] = cfg['test_args']
+            if 'gpus' in cfg:
+                out[name]['gpus'] = cfg['gpus']
+            if 'test_type' in cfg:
+                out[name]['test_type'] = cfg['test_type']
+        print(json.dumps(out, indent=2))
+        return
+
     fmt = '{:<12} {:<6} {:<18} {}'
     print(fmt.format('NAME', 'TEST', 'TEST_ARGS', 'DESCRIPTION'))
     print('-' * 78)
@@ -1224,7 +1253,7 @@ def cmd_grade(args):
     Output is color-coded to the terminal. Use ``--xml`` to also
     write JUnit XML (e.g. for Jenkins integration).
     """
-    names = resolve_names(args.names, require_test=True)
+    names = resolve_names(args.names, require_test=True, strict=False)
     tol = args.tol
 
     xfail = set()
@@ -1457,7 +1486,9 @@ def main():
     sub = parser.add_subparsers(dest='command')
 
     # list
-    sub.add_parser('list', help='show all configurations')
+    p = sub.add_parser('list', help='show all configurations')
+    p.add_argument('--json', action='store_true',
+                   help='output JSON for pipeline consumption')
 
     # build
     p = sub.add_parser('build', help='submit build jobs')

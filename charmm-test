@@ -241,116 +241,113 @@ SLURM_DEFAULT_GPUS = 1
 
 # ─── Embedded Slurm job scripts ───────────────────────────────────
 
-BUILD_SCRIPT = textwrap.dedent("""\
-    #!/bin/bash
-    set -eo pipefail
+def build_script(name, configure_args):
+    """Generate the bash script for a Slurm build job.
 
-    echo "=== BUILD ${build_name} === $(date)"
-    echo "configure: ${configure_arguments}"
+    Args:
+        name: Config name (e.g. 'gpu', 'sccdftb').
+        configure_args: Flags for ``./configure``.
 
-    module load anaconda/miniconda-latest
-    eval "$(conda shell.bash hook)"
-    conda activate "$HOME/testing/env/test"
-    set -u
+    Returns:
+        Bash script string with values baked in, avoiding
+        ``--export`` comma-parsing issues with Slurm.
+    """
+    return textwrap.dedent(f"""\
+        #!/bin/bash
+        set -eo pipefail
 
-    cd "$HOME/testing"
+        echo "=== BUILD {name} === $(date)"
+        echo "configure: {configure_args}"
 
-    if [[ ! -d "install-${build_name}" ]]; then
-        echo "Creating new CHARMM tree: install-${build_name}"
-        charmm/tool/NewCharmmTree "install-${build_name}"
-    fi
+        module load anaconda/miniconda-latest
+        eval "$(conda shell.bash hook)"
+        conda activate "$HOME/testing/env/test"
+        set -u
 
-    rm -rf "install-${build_name}/build/cmake"
+        cd "$HOME/testing"
 
-    cd "install-${build_name}"
-    ./configure --with-ninja ${configure_arguments}
-    ninja -j${SLURM_CPUS_PER_TASK:-4} -Cbuild/cmake install
+        if [[ ! -d "install-{name}" ]]; then
+            echo "Creating new CHARMM tree: install-{name}"
+            charmm/tool/NewCharmmTree "install-{name}"
+        fi
 
-    echo "=== BUILD ${build_name} DONE === $(date)"
-""")
-"""Bash script submitted to Slurm for build jobs.
+        rm -rf "install-{name}/build/cmake"
 
-Expects two environment variables exported by sbatch:
+        cd "install-{name}"
+        ./configure --with-ninja {configure_args}
+        ninja -j${{SLURM_CPUS_PER_TASK:-4}} -Cbuild/cmake install
 
-- ``build_name``: config name (e.g. 'gpu', 'sccdftb')
-- ``configure_arguments``: flags for ``./configure``
+        echo "=== BUILD {name} DONE === $(date)"
+    """)
 
-Uses ``SLURM_CPUS_PER_TASK`` (set by Slurm from ``--cpus-per-task``)
-for ninja parallelism. Creates a new CHARMM tree via
-``tool/NewCharmmTree`` if one doesn't exist yet.
-"""
+def test_script(name, test_args):
+    """Generate the bash script for a Slurm test job.
 
-TEST_SCRIPT = textwrap.dedent("""\
-    #!/bin/bash
-    set -eo pipefail
+    Args:
+        name: Config name (e.g. 'gpu', 'sccdftb').
+        test_args: Arguments for ``test.com``.
 
-    echo "=== TEST ${test_name} === $(date)"
-    echo "test_args: ${test_args}"
+    Returns:
+        Bash script string with values baked in.
+    """
+    sccdftb_link = ""
+    if name == "sccdftb":
+        sccdftb_link = (
+            '\n    # Link sccdftb data if needed\n'
+            '    if [[ ! -L "./sccdftb.dat" ]]; then\n'
+            '        ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat\n'
+            '    fi\n')
 
-    module load anaconda/miniconda-latest
-    eval "$(conda shell.bash hook)"
-    conda activate "$HOME/testing/env/test"
-    set -u
+    return textwrap.dedent(f"""\
+        #!/bin/bash
+        set -eo pipefail
 
-    cd "$HOME/testing/install-${test_name}/test"
+        echo "=== TEST {name} === $(date)"
+        echo "test_args: {test_args}"
 
-    # Link sccdftb data if needed
-    if [[ "${test_name}" == "sccdftb" ]] && [[ ! -L "./sccdftb.dat" ]]; then
-        ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat
-    fi
+        module load anaconda/miniconda-latest
+        eval "$(conda shell.bash hook)"
+        conda activate "$HOME/testing/env/test"
+        set -u
 
-    # Run test suite; test.com produces output.rpt for grading
-    # Grading is done separately by: charmm-test grade
-    /usr/bin/tcsh ./test.com ${test_args} 2>&1 | tee test.log || true
+        cd "$HOME/testing/install-{name}/test"
+        {sccdftb_link}
+        # Run test suite; test.com produces output.rpt for grading
+        # Grading is done separately by: charmm-test grade
+        /usr/bin/tcsh ./test.com {test_args} 2>&1 | tee test.log || true
 
-    echo "=== TEST ${test_name} DONE === $(date)"
-""")
-"""Bash script submitted to Slurm for test jobs.
+        echo "=== TEST {name} DONE === $(date)"
+    """)
 
-Expects two environment variables exported by sbatch:
 
-- ``test_name``: config name (e.g. 'gpu', 'sccdftb')
-- ``test_args``: arguments for ``test.com`` including ``output``
+def pytest_script(name):
+    """Generate the bash script for a Slurm pyCHARMM pytest job.
 
-Runs ``test.com`` which executes all test inputs and produces
-``output.rpt`` (a sed-filtered diff of test output vs benchmarks).
-The ``output.rpt`` is later parsed by ``charmm-test grade``.
+    Args:
+        name: Config name (e.g. 'gpu').
 
-For the sccdftb config, symlinks ``sccdftb.dat`` parameter data
-if not already present.
-"""
+    Returns:
+        Bash script string with values baked in.
+    """
+    return textwrap.dedent(f"""\
+        #!/bin/bash
+        set -eo pipefail
 
-PYTEST_SCRIPT = textwrap.dedent("""\
-    #!/bin/bash
-    set -eo pipefail
+        echo "=== PYTEST {name} === $(date)"
 
-    echo "=== PYTEST ${test_name} === $(date)"
+        module load anaconda/miniconda-latest
+        eval "$(conda shell.bash hook)"
+        conda activate "$HOME/testing/env/test"
+        set -u
 
-    module load anaconda/miniconda-latest
-    eval "$(conda shell.bash hook)"
-    conda activate "$HOME/testing/env/test"
-    set -u
+        cd "$HOME/testing/install-{name}"
+        export CHARMM_DATA_DIR=$(pwd)/toppar
 
-    cd "$HOME/testing/install-${test_name}"
-    export CHARMM_DATA_DIR=$(pwd)/toppar
+        cd tool/pycharmm
+        pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
 
-    cd tool/pycharmm
-    pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
-
-    echo "=== PYTEST ${test_name} DONE === $(date)"
-""")
-"""Bash script submitted to Slurm for pycharmm pytest jobs.
-
-Expects one environment variable exported by sbatch:
-
-- ``test_name``: config name (e.g. 'pycharmm')
-
-Sets ``CHARMM_DATA_DIR`` to the install tree's ``toppar/`` directory
-so tests can find CHARMM parameter files. pycharmm itself is already
-pip-installed during the build (``ninja install``).
-
-Produces ``pytest-results.xml`` (JUnit XML) and ``pytest.log``.
-"""
+        echo "=== PYTEST {name} DONE === $(date)"
+    """)
 
 
 # ─── Terminal colors ───────────────────────────────────────────────
@@ -604,11 +601,11 @@ def cmd_build(args):
             '--nodes=1', '--ntasks-per-node=1',
             f'--cpus-per-task={SLURM_BUILD_CPUS}',
             f'--gres=gpu:{SLURM_DEFAULT_GPUS}',
-            f'--export=build_name={name},configure_arguments={cfg["configure"]}',
+            '--export=NONE',
             f'--output={idir}/%x-%j.out',
         ]
 
-        job_id = sbatch(sbatch_args, script_body=BUILD_SCRIPT)
+        job_id = sbatch(sbatch_args, script_body=build_script(name, cfg['configure']))
         job_ids[name] = job_id
         print(f"  {name:<12} build submitted  (job {job_id})")
 
@@ -644,10 +641,8 @@ def cmd_test(args, dependencies=None):
         gpus = cfg.get('gpus', SLURM_DEFAULT_GPUS)
 
         # Standard test.com
-        script = TEST_SCRIPT
         test_args = cfg.get('test_args', 'cmake')
         ntasks, cpus = parse_slurm_params(test_args)
-        export = f'test_name={name},test_args={test_args} output'
         tdir = test_dir(name)
         tdir.mkdir(parents=True, exist_ok=True)
         output_path = f'{tdir}/%x-%j.out'
@@ -660,14 +655,15 @@ def cmd_test(args, dependencies=None):
             f'--ntasks-per-node={ntasks}',
             f'--cpus-per-task={cpus}',
             f'--gres=gpu:{gpus}',
-            f'--export={export}',
+            '--export=NONE',
             f'--output={output_path}',
         ]
 
         if dependencies and name in dependencies:
             sbatch_args.append(f'--dependency=afterok:{dependencies[name]}')
 
-        job_id = sbatch(sbatch_args, script_body=script)
+        job_id = sbatch(sbatch_args,
+                        script_body=test_script(name, f'{test_args} output'))
         job_ids[name] = job_id
         dep_info = (f' (after job {dependencies[name]})'
                     if dependencies and name in dependencies else '')
@@ -675,12 +671,11 @@ def cmd_test(args, dependencies=None):
 
         # pyCHARMM pytest — submit as a second job if requested
         if cfg.get('pytest'):
-            pytest_export = f'test_name={name}'
             outdir = install_dir(name) / 'tool' / 'pycharmm'
             outdir.mkdir(parents=True, exist_ok=True)
             pytest_output = f'{outdir}/%x-%j.out'
 
-            pytest_args = [
+            pytest_sbatch = [
                 f'--job-name={name}-pytest',
                 f'--time={SLURM_TEST_TIME}',
                 f'--partition={SLURM_PARTITION}',
@@ -688,15 +683,16 @@ def cmd_test(args, dependencies=None):
                 '--ntasks-per-node=1',
                 '--cpus-per-task=1',
                 f'--gres=gpu:{gpus}',
-                f'--export={pytest_export}',
+                '--export=NONE',
                 f'--output={pytest_output}',
             ]
 
             if dependencies and name in dependencies:
-                pytest_args.append(
+                pytest_sbatch.append(
                     f'--dependency=afterok:{dependencies[name]}')
 
-            pytest_id = sbatch(pytest_args, script_body=PYTEST_SCRIPT)
+            pytest_id = sbatch(pytest_sbatch,
+                               script_body=pytest_script(name))
             print(f"  {name:<12} pytest submitted  (job {pytest_id}){dep_info}")
 
     return job_ids

@@ -189,6 +189,23 @@ pipeline {
                 }
             }
         }
+        stage("Pytest pyCHARMM") {
+            steps {
+                script {
+                    echo "Running pyCHARMM pytest suite against install-gpu..."
+                    sh """
+                        ${PYTHON_SETUP}
+                        pushd install-gpu
+                        export CHARMM_DATA_DIR=\$(pwd)/toppar
+                        cd tool/pycharmm
+                        nice -n 10 pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
+                        popd
+                    """
+                    junit 'install-gpu/tool/pycharmm/pytest-results.xml'
+                    echo "...finished pyCHARMM pytest"
+                }
+            }
+        }
         stage("Report") {
             steps {
                 script {
@@ -211,7 +228,7 @@ pipeline {
     }
     post {
         always {
-            archiveArtifacts artifacts: 'install-*/test/*.log,install-*/test/*.xml',
+            archiveArtifacts artifacts: 'install-*/test/*.log,install-*/test/*.xml,install-gpu/tool/pycharmm/pytest*',
                              allowEmptyArchive: true
         }
         failure {

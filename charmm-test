@@ -143,6 +143,7 @@ CONFIGS = {
         'configure': f'-u --with-blade --with-fftdock --with-repdstr {PIP_LOCK}',
         'test_args': 'cmake',
         'gpus': 2,
+        'pytest': True,
         'description': 'GPU (BLaDE + FFTDock + REPDSTR), serial tests',
     },
     'gpu2': {
@@ -212,10 +213,10 @@ Each entry is a dict with:
 - **test_args** (str, optional): Arguments for ``test.com``. The word
   ``output`` is appended automatically. ``M N`` sets MPI ranks to N,
   ``X T`` sets threads per rank to T. Absent means no test suite.
-- **test_type** (str, optional): ``'pytest'`` for pycharmm tests instead
-  of ``test.com``. Defaults to ``test.com`` if absent.
 - **gpus** (int, optional): Number of GPUs to request. Defaults to
   `SLURM_DEFAULT_GPUS`.
+- **pytest** (bool, optional): If ``True``, also run pyCHARMM pytest
+  suite against this build (in addition to ``test.com``).
 - **test** (bool, optional): Set ``False`` for build-only configs.
 - **description** (str): Human-readable description of the config.
 """
@@ -539,8 +540,8 @@ def cmd_list(args):
                 out[name]['test_args'] = cfg['test_args']
             if 'gpus' in cfg:
                 out[name]['gpus'] = cfg['gpus']
-            if 'test_type' in cfg:
-                out[name]['test_type'] = cfg['test_type']
+            if cfg.get('pytest'):
+                out[name]['pytest'] = True
         print(json.dumps(out, indent=2))
         return
 
@@ -637,28 +638,16 @@ def cmd_test(args, dependencies=None):
 
     for name in names:
         cfg = CONFIGS[name]
-        test_type = cfg.get('test_type', 'test.com')
         gpus = cfg.get('gpus', SLURM_DEFAULT_GPUS)
 
-        if test_type == 'pytest':
-            # pycharmm pytest — single-process, no MPI
-            script = PYTEST_SCRIPT
-            ntasks, cpus = 1, 1
-            export = f'test_name={name}'
-            outdir = install_dir(name) / 'tool' / 'pycharmm'
-            outdir.mkdir(parents=True, exist_ok=True)
-            output_path = f'{outdir}/%x-%j.out'
-            label = 'pytest'
-        else:
-            # Standard test.com
-            script = TEST_SCRIPT
-            test_args = cfg.get('test_args', 'cmake')
-            ntasks, cpus = parse_slurm_params(test_args)
-            export = f'test_name={name},test_args={test_args} output'
-            tdir = test_dir(name)
-            tdir.mkdir(parents=True, exist_ok=True)
-            output_path = f'{tdir}/%x-%j.out'
-            label = 'test'
+        # Standard test.com
+        script = TEST_SCRIPT
+        test_args = cfg.get('test_args', 'cmake')
+        ntasks, cpus = parse_slurm_params(test_args)
+        export = f'test_name={name},test_args={test_args} output'
+        tdir = test_dir(name)
+        tdir.mkdir(parents=True, exist_ok=True)
+        output_path = f'{tdir}/%x-%j.out'
 
         sbatch_args = [
             f'--job-name={name}-test',
@@ -679,7 +668,33 @@ def cmd_test(args, dependencies=None):
         job_ids[name] = job_id
         dep_info = (f' (after job {dependencies[name]})'
                     if dependencies and name in dependencies else '')
-        print(f"  {name:<12} {label:<6}submitted  (job {job_id}){dep_info}")
+        print(f"  {name:<12} test  submitted  (job {job_id}){dep_info}")
+
+        # pyCHARMM pytest — submit as a second job if requested
+        if cfg.get('pytest'):
+            pytest_export = f'test_name={name}'
+            outdir = install_dir(name) / 'tool' / 'pycharmm'
+            outdir.mkdir(parents=True, exist_ok=True)
+            pytest_output = f'{outdir}/%x-%j.out'
+
+            pytest_args = [
+                f'--job-name={name}-pytest',
+                f'--time={SLURM_TEST_TIME}',
+                f'--partition={SLURM_PARTITION}',
+                '--nodes=1',
+                '--ntasks-per-node=1',
+                '--cpus-per-task=1',
+                f'--gres=gpu:{gpus}',
+                f'--export={pytest_export}',
+                f'--output={pytest_output}',
+            ]
+
+            if dependencies and name in dependencies:
+                pytest_args.append(
+                    f'--dependency=afterok:{dependencies[name]}')
+
+            pytest_id = sbatch(pytest_args, script_body=PYTEST_SCRIPT)
+            print(f"  {name:<12} pytest submitted  (job {pytest_id}){dep_info}")
 
     return job_ids
 

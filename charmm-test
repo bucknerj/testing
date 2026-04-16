@@ -1425,6 +1425,105 @@ def cmd_grade(args):
             else:
                 results.append((f'{name}/{tname}', None, '', elapsed))
 
+    # Collect pytest results for configs that have pytest: True
+    for name in names:
+        cfg = CONFIGS.get(name, {})
+        if not cfg.get('pytest'):
+            continue
+
+        pytest_xml = install_dir(name) / 'tool' / 'pycharmm' / 'pytest-results.xml'
+        suite_name = f'{name}/pytest'
+
+        if not pytest_xml.is_file():
+            print(f"  {suite_name:<12} {colored('SKIP', Color.SKIP)}"
+                  f" -- no pytest-results.xml")
+            n_skip += 1
+            results.append((suite_name, 'skipped',
+                            'no pytest-results.xml', 0.0))
+            continue
+
+        # Parse the pytest JUnit XML
+        try:
+            tree = ET.parse(pytest_xml)
+        except ET.ParseError as exc:
+            print(f"  {suite_name:<12} {colored('ERROR', Color.ERROR)}"
+                  f" -- malformed XML: {exc}")
+            n_error += 1
+            results.append((suite_name, 'error',
+                            f'malformed XML: {exc}', 0.0))
+            continue
+
+        root = tree.getroot()
+        # pytest JUnit XML can be <testsuites><testsuite>... or <testsuite>...
+        if root.tag == 'testsuites':
+            suites = root.findall('testsuite')
+        else:
+            suites = [root]
+
+        pt_pass = pt_fail = pt_error = pt_skip = 0
+        pt_failures = []
+        pt_errors = []
+
+        for ts in suites:
+            for tc in ts.findall('testcase'):
+                tc_name = tc.get('name', '?')
+                elapsed = float(tc.get('time', 0))
+                full_name = f'{suite_name}/{tc_name}'
+
+                if tc.find('failure') is not None:
+                    msg = tc.find('failure').get('message', 'FAIL')
+                    pt_fail += 1
+                    pt_failures.append((tc_name, msg))
+                    results.append((full_name, 'failure', msg, elapsed))
+                elif tc.find('error') is not None:
+                    msg = tc.find('error').get('message', 'ERROR')
+                    pt_error += 1
+                    pt_errors.append((tc_name, msg))
+                    results.append((full_name, 'error', msg, elapsed))
+                elif tc.find('skipped') is not None:
+                    pt_skip += 1
+                    results.append((full_name, 'skipped', 'skipped',
+                                    elapsed))
+                else:
+                    pt_pass += 1
+                    results.append((full_name, None, '', elapsed))
+
+        pt_total = pt_pass + pt_fail + pt_error + pt_skip
+
+        if pt_errors:
+            status_str = colored('ERROR', Color.ERROR)
+            n_error += 1
+        elif pt_failures:
+            status_str = colored('FAIL', Color.FAIL)
+            n_fail += 1
+        elif pt_skip and pt_pass == 0:
+            status_str = colored('SKIP', Color.SKIP)
+            n_skip += 1
+        else:
+            status_str = colored('PASS', Color.PASS)
+            n_pass += 1
+
+        counts = f'{pt_pass}/{pt_total} passed'
+        if pt_failures:
+            counts += f', {len(pt_failures)} failed'
+        if pt_errors:
+            counts += f', {len(pt_errors)} errors'
+        if pt_skip:
+            counts += f', {pt_skip} skipped'
+
+        print(f"  {suite_name:<12} {status_str:>20}  {counts}")
+
+        if not args.quiet:
+            for tc_name, msg in pt_errors[:5]:
+                print(f"               {colored('ERROR', Color.ERROR)}"
+                      f" {tc_name}: {msg}")
+            for tc_name, msg in pt_failures[:5]:
+                print(f"               {colored('FAIL', Color.FAIL)}"
+                      f"  {tc_name}: {msg}")
+            remaining = len(pt_errors[5:]) + len(pt_failures[5:])
+            if remaining:
+                print(f"               ... and {remaining} more")
+
     # Overall summary
     total_configs = n_pass + n_fail + n_error + n_skip
     print(f"\n  {Color.BOLD}{total_configs} configs: "

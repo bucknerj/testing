@@ -243,7 +243,7 @@ SLURM_DEFAULT_GPUS = 1
 
 BUILD_SCRIPT = textwrap.dedent("""\
     #!/bin/bash
-    set -euo pipefail
+    set -eo pipefail
 
     echo "=== BUILD ${build_name} === $(date)"
     echo "configure: ${configure_arguments}"
@@ -251,6 +251,7 @@ BUILD_SCRIPT = textwrap.dedent("""\
     module load anaconda/miniconda-latest
     eval "$(conda shell.bash hook)"
     conda activate "$HOME/testing/env/test"
+    set -u
 
     cd "$HOME/testing"
 
@@ -281,7 +282,7 @@ for ninja parallelism. Creates a new CHARMM tree via
 
 TEST_SCRIPT = textwrap.dedent("""\
     #!/bin/bash
-    set -euo pipefail
+    set -eo pipefail
 
     echo "=== TEST ${test_name} === $(date)"
     echo "test_args: ${test_args}"
@@ -289,6 +290,7 @@ TEST_SCRIPT = textwrap.dedent("""\
     module load anaconda/miniconda-latest
     eval "$(conda shell.bash hook)"
     conda activate "$HOME/testing/env/test"
+    set -u
 
     cd "$HOME/testing/install-${test_name}/test"
 
@@ -320,13 +322,14 @@ if not already present.
 
 PYTEST_SCRIPT = textwrap.dedent("""\
     #!/bin/bash
-    set -euo pipefail
+    set -eo pipefail
 
     echo "=== PYTEST ${test_name} === $(date)"
 
     module load anaconda/miniconda-latest
     eval "$(conda shell.bash hook)"
     conda activate "$HOME/testing/env/test"
+    set -u
 
     cd "$HOME/testing/install-${test_name}"
     export CHARMM_DATA_DIR=$(pwd)/toppar

@@ -198,7 +198,7 @@ pipeline {
                     echo "Grading test results..."
                     sh """
                         ${PYTHON_SETUP}
-                        export CHARMM_TEST_HOME=\${WORKSPACE}/testing
+                        export CHARMM_TEST_HOME=\${WORKSPACE}
                         python \${WORKSPACE}/testing/charmm-test grade \
                             --tol 0.0001 --xml test-results.xml \
                             ${testableNames}

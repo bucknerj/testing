@@ -264,16 +264,8 @@ def build_script(name, configure_args):
         conda activate "$HOME/testing/env/test"
         set -u
 
-        cd "$HOME/testing"
-
-        if [[ ! -d "install-{name}" ]]; then
-            echo "Creating new CHARMM tree: install-{name}"
-            charmm/tool/NewCharmmTree "install-{name}"
-        fi
-
-        rm -rf "install-{name}/build/cmake"
-
-        cd "install-{name}"
+        cd "$HOME/testing/install-{name}"
+        rm -rf build/cmake
         ./configure --with-ninja {configure_args}
         ninja -j${{SLURM_CPUS_PER_TASK:-4}} -Cbuild/cmake install
 
@@ -592,7 +584,14 @@ def cmd_build(args):
     for name in names:
         cfg = CONFIGS[name]
         idir = install_dir(name)
-        idir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure a proper CHARMM tree exists (not just a bare directory)
+        if not (idir / 'configure').exists():
+            print(f"  {name:<12} creating CHARMM tree...")
+            subprocess.run(
+                [str(CHARMM_DIR / 'tool' / 'NewCharmmTree'), str(idir)],
+                cwd=TESTING_HOME, check=True)
+
 
         sbatch_args = [
             f'--job-name={name}-build',

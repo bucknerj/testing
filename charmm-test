@@ -12,6 +12,7 @@ Subcommands:
     test        Submit Slurm test jobs
     run         Build then test, chained via Slurm dependencies
     grade       Grade test results with numerical tolerance comparison
+    report      Generate markdown + HTML report with delta vs previous run
     status      Show active Slurm jobs
     bench       Promote test output to benchmark
     clean       Archive old test results
@@ -114,6 +115,9 @@ CHARMM_DIR = TESTING_HOME / 'charmm'
 
 CONDA_ENV = TESTING_HOME / 'env' / 'test'
 """Conda/micromamba environment prefix used by Slurm jobs."""
+
+REPORTS_DIR = TESTING_HOME / 'reports'
+"""Directory for archived markdown + HTML reports, one per run."""
 
 DEFAULT_TOL = 0.0001
 """Default numerical tolerance for grading.
@@ -1584,6 +1588,523 @@ def generate_junit(results, output_path):
         fh.write('\n')
 
 
+# ─── Reporting ─────────────────────────────────────────────────────
+
+def parse_junit_xml(path):
+    """Parse a JUnit XML file into a dict of {full_test_name: TestResult}.
+
+    The full_test_name is ``<suite>/<case>``. TestResult is a tuple of
+    (status, message, elapsed). Status is one of:
+
+    - ``'passed'``
+    - ``'failed'``
+    - ``'error'``
+    - ``'skipped'``
+    """
+    results = {}
+    if not Path(path).is_file():
+        return results
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+    suites = root.findall('testsuite') if root.tag == 'testsuites' else [root]
+
+    for ts in suites:
+        suite_name = ts.get('name', '?')
+        for tc in ts.findall('testcase'):
+            case_name = tc.get('name', '?')
+            full = f'{suite_name}/{case_name}'
+            elapsed = float(tc.get('time', 0))
+
+            if tc.find('error') is not None:
+                el = tc.find('error')
+                msg = el.get('message') or (el.text or '').strip() or 'error'
+                results[full] = ('error', msg, elapsed)
+            elif tc.find('failure') is not None:
+                el = tc.find('failure')
+                msg = el.get('message') or (el.text or '').strip() or 'failure'
+                results[full] = ('failed', msg, elapsed)
+            elif tc.find('skipped') is not None:
+                results[full] = ('skipped', 'skipped', elapsed)
+            else:
+                results[full] = ('passed', '', elapsed)
+
+    return results
+
+
+def find_previous_xml(reports_dir, today_stem):
+    """Find the most recent archived XML in reports_dir, excluding today's."""
+    if not reports_dir.is_dir():
+        return None
+    candidates = sorted(
+        p for p in reports_dir.glob('*.xml') if p.stem != today_stem)
+    return candidates[-1] if candidates else None
+
+
+def compute_deltas(current, previous):
+    """Categorize tests by how their status changed since the previous run.
+
+    Returns a dict with keys:
+    - ``regressions``: list of (name, cur_status, cur_msg) — was passing or
+      absent, now failing/error.
+    - ``fixes``: list of (name, prev_status) — was failing/error, now passing.
+    - ``persistent``: list of (name, cur_status, cur_msg) — failing in both.
+    - ``new_tests``: list of (name, cur_status) — not in previous run.
+    """
+    BAD = {'failed', 'error'}
+
+    regressions = []
+    fixes = []
+    persistent = []
+    new_tests = []
+
+    for name, (status, msg, _elapsed) in current.items():
+        prev = previous.get(name)
+        if prev is None:
+            new_tests.append((name, status))
+            if status in BAD:
+                regressions.append((name, status, msg))
+            continue
+
+        prev_status = prev[0]
+        if status in BAD and prev_status not in BAD:
+            regressions.append((name, status, msg))
+        elif status == 'passed' and prev_status in BAD:
+            fixes.append((name, prev_status))
+        elif status in BAD and prev_status in BAD:
+            persistent.append((name, status, msg))
+
+    return {
+        'regressions': sorted(regressions),
+        'fixes': sorted(fixes),
+        'persistent': sorted(persistent),
+        'new_tests': sorted(new_tests),
+    }
+
+
+def summarize_results(results):
+    """Return {'passed': N, 'failed': N, 'error': N, 'skipped': N, 'total': N}."""
+    summary = dict(passed=0, failed=0, error=0, skipped=0)
+    for status, _msg, _elapsed in results.values():
+        summary[status if status != 'error' else 'error'] += 1
+    summary['total'] = sum(summary.values())
+    return summary
+
+
+def per_config_summary(results):
+    """Return {suite_name: {passed, failed, error, skipped, total}} sorted by name."""
+    by_suite = {}
+    for full, (status, _msg, _elapsed) in results.items():
+        suite = full.split('/', 1)[0]
+        s = by_suite.setdefault(
+            suite, dict(passed=0, failed=0, error=0, skipped=0))
+        s[status] = s.get(status, 0) + 1
+    for suite, s in by_suite.items():
+        s['total'] = sum(v for k, v in s.items() if k != 'total')
+    return dict(sorted(by_suite.items()))
+
+
+def render_markdown(current, previous, deltas, meta):
+    """Render the report as a Markdown string."""
+    cur = summarize_results(current)
+    prev = summarize_results(previous) if previous else None
+    lines = []
+
+    lines.append(f"# CHARMM Test Report — {meta['date']}")
+    lines.append("")
+    lines.append(f"**Branch**: {meta['branch']}  ")
+    lines.append(f"**Configs**: {meta['configs']}  ")
+    if meta.get('previous_date'):
+        lines.append(f"**Comparing against**: {meta['previous_date']}")
+    lines.append("")
+
+    # Summary table
+    lines.append("## Summary")
+    lines.append("")
+    if prev:
+        def delta(k):
+            d = cur[k] - prev[k]
+            if d == 0:
+                return "0"
+            return f"{'+' if d > 0 else ''}{d}"
+        lines.append("|         | Current | Previous | Δ     |")
+        lines.append("|---------|--------:|---------:|------:|")
+        for k in ('passed', 'failed', 'error', 'skipped'):
+            lines.append(
+                f"| {k.capitalize():<7} | {cur[k]:>7} | {prev[k]:>8} | {delta(k):>5} |")
+    else:
+        lines.append("| Status  | Count |")
+        lines.append("|---------|------:|")
+        for k in ('passed', 'failed', 'error', 'skipped'):
+            lines.append(f"| {k.capitalize():<7} | {cur[k]:>5} |")
+    lines.append("")
+
+    # Verdict
+    n_reg = len(deltas['regressions'])
+    n_fix = len(deltas['fixes'])
+    if prev is None:
+        lines.append("_No previous report found — this is a baseline run._")
+    elif n_reg > 0:
+        lines.append(f"**Verdict**: 🚨 {n_reg} new regression"
+                     f"{'s' if n_reg != 1 else ''}, "
+                     f"{n_fix} fix{'es' if n_fix != 1 else ''}.")
+    elif n_fix > 0:
+        lines.append(f"**Verdict**: ✅ No regressions, "
+                     f"{n_fix} fix{'es' if n_fix != 1 else ''}.")
+    else:
+        lines.append("**Verdict**: ✅ No changes since previous run.")
+    lines.append("")
+
+    # Regressions
+    lines.append(f"## 🚨 Regressions ({n_reg})")
+    lines.append("")
+    if n_reg:
+        lines.append("Tests that were passing (or new) last run and are now failing:")
+        lines.append("")
+        lines.append("| Test | Status | Detail |")
+        lines.append("|------|--------|--------|")
+        for name, status, msg in deltas['regressions']:
+            short = (msg[:80] + '…') if len(msg) > 80 else msg
+            lines.append(f"| `{name}` | {status.upper()} | {short} |")
+    else:
+        lines.append("_None._")
+    lines.append("")
+
+    # Fixes
+    lines.append(f"## ✅ Fixes ({n_fix})")
+    lines.append("")
+    if n_fix:
+        lines.append("Tests that were failing last run and are now passing:")
+        lines.append("")
+        for name, prev_status in deltas['fixes']:
+            lines.append(f"- `{name}` _(was {prev_status})_")
+    else:
+        lines.append("_No previously failing tests are now passing._")
+    lines.append("")
+
+    # Persistent failures (collapsed)
+    n_persist = len(deltas['persistent'])
+    lines.append(f"## ⚠️ Persistent Failures ({n_persist})")
+    lines.append("")
+    if n_persist:
+        lines.append(f"Tests failing in both this run and the previous.")
+        lines.append("")
+        lines.append("<details><summary>Expand list</summary>")
+        lines.append("")
+        for name, status, msg in deltas['persistent']:
+            short = (msg[:80] + '…') if len(msg) > 80 else msg
+            lines.append(f"- `{name}` — **{status.upper()}** — {short}")
+        lines.append("")
+        lines.append("</details>")
+    else:
+        lines.append("_None._")
+    lines.append("")
+
+    # Per-config table
+    lines.append("## Per-Config Results")
+    lines.append("")
+    lines.append("| Config | Pass | Fail | Error | Skip | Status |")
+    lines.append("|--------|-----:|-----:|------:|-----:|--------|")
+    for suite, s in per_config_summary(current).items():
+        if s['error']:
+            badge = "🚨 ERROR"
+        elif s['failed']:
+            badge = "❌ FAIL"
+        elif s['passed'] == 0 and s['skipped']:
+            badge = "⏭️ SKIP"
+        else:
+            badge = "✅ PASS"
+        lines.append(
+            f"| `{suite}` | {s['passed']}/{s['total']} | "
+            f"{s['failed']} | {s['error']} | {s['skipped']} | {badge} |")
+    lines.append("")
+
+    # Full details per config (collapsed)
+    lines.append("## Failure Details")
+    lines.append("")
+    by_suite_fails = {}
+    for name, (status, msg, _) in sorted(current.items()):
+        if status in ('failed', 'error'):
+            suite = name.split('/', 1)[0]
+            by_suite_fails.setdefault(suite, []).append((name, status, msg))
+
+    if not by_suite_fails:
+        lines.append("_No failures._")
+    else:
+        for suite, items in sorted(by_suite_fails.items()):
+            lines.append(f"<details><summary><b>{suite}</b> — "
+                         f"{len(items)} non-passing test"
+                         f"{'s' if len(items) != 1 else ''}</summary>")
+            lines.append("")
+            for name, status, msg in items:
+                short = (msg[:120] + '…') if len(msg) > 120 else msg
+                lines.append(f"- `{name}` — **{status.upper()}** — {short}")
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
+
+    return '\n'.join(lines) + '\n'
+
+
+HTML_CSS = """\
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       max-width: 960px; margin: 2em auto; padding: 0 1em;
+       color: #1f2328; line-height: 1.5; }
+h1, h2, h3 { border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em;
+             margin-top: 1.5em; }
+table { border-collapse: collapse; margin: 1em 0; }
+th, td { padding: 6px 12px; border: 1px solid #d0d7de; }
+th { background: #f6f8fa; }
+code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px;
+       font-size: 0.9em; }
+details { margin: 1em 0; padding: 0.5em 1em; background: #f6f8fa;
+          border-radius: 6px; }
+summary { cursor: pointer; font-weight: 600; }
+.verdict { font-size: 1.1em; padding: 0.75em 1em; border-radius: 6px; }
+.verdict-bad  { background: #ffebe9; border-left: 4px solid #cf222e; }
+.verdict-good { background: #dafbe1; border-left: 4px solid #1a7f37; }
+.verdict-ok   { background: #ddf4ff; border-left: 4px solid #0969da; }
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+"""
+
+
+def md_to_html(md_text):
+    """Minimal markdown → HTML converter tuned for our report format.
+
+    We control the markdown, so we can target exactly the constructs we use
+    (headings, tables, lists, bold, code, details/summary, hr). This avoids
+    pulling in the `markdown` package as a dependency.
+    """
+    import html as _html
+    import re
+
+    out = []
+    in_table = False
+    in_list = False
+    in_paragraph = False
+
+    def close_para():
+        nonlocal in_paragraph
+        if in_paragraph:
+            out.append('</p>')
+            in_paragraph = False
+
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            out.append('</ul>')
+            in_list = False
+
+    def close_table():
+        nonlocal in_table
+        if in_table:
+            out.append('</tbody></table>')
+            in_table = False
+
+    def inline(text):
+        # Escape HTML, then re-apply our markup.
+        t = _html.escape(text, quote=False)
+        # Already-escaped <details>/<summary>/</details>/</summary> passthrough
+        t = re.sub(r'&lt;(/?(?:details|summary))&gt;', r'<\1>', t)
+
+        # Protect code spans with placeholders so their contents
+        # aren't interpreted as italic/bold markup.
+        code_spans = []
+
+        def _stash_code(m):
+            code_spans.append(m.group(1))
+            return f'\x00CODE{len(code_spans) - 1}\x00'
+
+        t = re.sub(r'`([^`]+)`', _stash_code, t)
+        # Bold
+        t = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', t)
+        # Italic (single underscores / asterisks)
+        t = re.sub(r'(?<![*_])\*([^*]+)\*(?!\*)', r'<em>\1</em>', t)
+        t = re.sub(r'(?<!_)_([^_]+)_(?!_)', r'<em>\1</em>', t)
+        # Links [text](url)
+        t = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', t)
+        # Restore code spans
+        for idx, content in enumerate(code_spans):
+            t = t.replace(f'\x00CODE{idx}\x00', f'<code>{content}</code>')
+        return t
+
+    lines = md_text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        if line.startswith('# '):
+            close_para(); close_list(); close_table()
+            out.append(f'<h1>{inline(line[2:])}</h1>')
+        elif line.startswith('## '):
+            close_para(); close_list(); close_table()
+            out.append(f'<h2>{inline(line[3:])}</h2>')
+        elif line.startswith('### '):
+            close_para(); close_list(); close_table()
+            out.append(f'<h3>{inline(line[4:])}</h3>')
+        elif line.startswith('|'):
+            # Table row
+            close_para(); close_list()
+            cells = [c.strip() for c in line.strip('|').split('|')]
+            # Separator row: |---|---|
+            if all(re.match(r'^:?-+:?$', c) for c in cells if c):
+                i += 1
+                continue
+            if not in_table:
+                out.append('<table><thead><tr>')
+                for c in cells:
+                    out.append(f'<th>{inline(c)}</th>')
+                out.append('</tr></thead><tbody>')
+                in_table = True
+            else:
+                out.append('<tr>')
+                for c in cells:
+                    out.append(f'<td>{inline(c)}</td>')
+                out.append('</tr>')
+        elif line.startswith('- '):
+            close_para(); close_table()
+            if not in_list:
+                out.append('<ul>')
+                in_list = True
+            out.append(f'<li>{inline(line[2:])}</li>')
+        elif line.strip().startswith('<details'):
+            close_para(); close_list(); close_table()
+            out.append(line)
+        elif line.strip() in ('</details>', '<summary>', '</summary>'):
+            out.append(line)
+        elif line.strip().startswith('<summary>') and line.strip().endswith('</summary>'):
+            # One-line summary: <summary>...</summary>
+            inner = line.strip()[len('<summary>'):-len('</summary>')]
+            out.append(f'<summary>{inline(inner)}</summary>')
+        elif not line.strip():
+            close_para(); close_list(); close_table()
+        else:
+            close_list(); close_table()
+            if not in_paragraph:
+                out.append('<p>')
+                in_paragraph = True
+            out.append(inline(line))
+        i += 1
+
+    close_para(); close_list(); close_table()
+    return '\n'.join(out)
+
+
+def render_html(md_text, title):
+    """Wrap markdown-rendered HTML in a styled page."""
+    body = md_to_html(md_text)
+    return (
+        '<!doctype html>\n'
+        '<html lang="en"><head><meta charset="utf-8">'
+        f'<title>{title}</title>'
+        f'<style>{HTML_CSS}</style>'
+        '</head><body>\n'
+        f'{body}\n'
+        '</body></html>\n'
+    )
+
+
+def regenerate_index(reports_dir):
+    """Regenerate reports/index.html listing all reports by date (newest first)."""
+    reports = sorted(
+        (p for p in reports_dir.glob('*.md') if p.stem != 'index'),
+        reverse=True)
+
+    md_lines = [
+        '# CHARMM Test Reports',
+        '',
+        f'_{len(reports)} report{"s" if len(reports) != 1 else ""} archived._',
+        '',
+    ]
+    for md_path in reports:
+        stem = md_path.stem
+        html_sibling = reports_dir / f'{stem}.html'
+        link = f'{stem}.html' if html_sibling.exists() else f'{stem}.md'
+        md_lines.append(f'- [{stem}]({link})')
+
+    index_md = '\n'.join(md_lines) + '\n'
+    (reports_dir / 'index.md').write_text(index_md)
+    (reports_dir / 'index.html').write_text(
+        render_html(index_md, 'CHARMM Test Reports'))
+
+
+def cmd_report(args):
+    """Generate a markdown + HTML report from test-results.xml.
+
+    Compares against the most recent previous archived XML in the reports
+    directory to compute regressions, fixes, and persistent failures.
+
+    Writes ``<date>.md``, ``<date>.html``, and archives the input XML as
+    ``<date>.xml`` in ``~/testing/reports/`` (or ``--reports-dir``). Also
+    regenerates ``index.html`` for browsing.
+    """
+    xml_path = Path(args.xml)
+    if not xml_path.is_file():
+        print(f"XML file not found: {xml_path}", file=sys.stderr)
+        sys.exit(1)
+
+    reports_dir = Path(args.reports_dir) if args.reports_dir else REPORTS_DIR
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use an explicit date from --date or today in local time
+    import datetime
+    date_stem = args.date or datetime.date.today().isoformat()
+
+    current = parse_junit_xml(xml_path)
+    prev_xml = find_previous_xml(reports_dir, date_stem)
+    previous = parse_junit_xml(prev_xml) if prev_xml else {}
+
+    deltas = compute_deltas(current, previous)
+
+    # Try to discover the branch + SHA from the CHARMM source tree.
+    branch = 'unknown'
+    try:
+        if CHARMM_DIR.is_dir():
+            branch = subprocess.run(
+                ['git', '-C', str(CHARMM_DIR), 'describe',
+                 '--always', '--all', '--dirty'],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip() or 'unknown'
+    except Exception:
+        pass
+
+    configs = ', '.join(sorted({
+        name.split('/', 1)[0] for name in current
+    })) or '(none)'
+
+    meta = {
+        'date': date_stem,
+        'branch': branch,
+        'configs': configs,
+        'previous_date': prev_xml.stem if prev_xml else None,
+    }
+
+    md = render_markdown(current, previous, deltas, meta)
+    html = render_html(md, f'CHARMM Test Report — {date_stem}')
+
+    md_path = reports_dir / f'{date_stem}.md'
+    html_path = reports_dir / f'{date_stem}.html'
+    archive_xml = reports_dir / f'{date_stem}.xml'
+
+    md_path.write_text(md)
+    html_path.write_text(html)
+    archive_xml.write_bytes(xml_path.read_bytes())
+
+    regenerate_index(reports_dir)
+
+    n_reg = len(deltas['regressions'])
+    n_fix = len(deltas['fixes'])
+    print(f"Report written: {md_path}")
+    print(f"           and: {html_path}")
+    print(f"  archived XML: {archive_xml}")
+    if prev_xml:
+        print(f"  comparing to: {prev_xml.stem}")
+        print(f"  regressions: {n_reg}, fixes: {n_fix}")
+    else:
+        print("  (no previous report — this is a baseline)")
+
+
 # ─── Main ──────────────────────────────────────────────────────────
 
 def main():
@@ -1632,6 +2153,16 @@ def main():
     p.add_argument('--quiet', action='store_true',
                    help='suppress failure details')
 
+    # report
+    p = sub.add_parser(
+        'report',
+        help='generate markdown + HTML report from JUnit XML')
+    p.add_argument('xml', help='JUnit XML input (from charmm-test grade --xml)')
+    p.add_argument('--reports-dir',
+                   help=f'output directory (default: {REPORTS_DIR})')
+    p.add_argument('--date',
+                   help='report date stem (default: today YYYY-MM-DD)')
+
     # status
     sub.add_parser('status', help='show Slurm job status')
 
@@ -1658,6 +2189,7 @@ def main():
         'test': cmd_test,
         'run': cmd_run,
         'grade': cmd_grade,
+        'report': cmd_report,
         'status': cmd_status,
         'bench': cmd_bench,
         'clean': cmd_clean,

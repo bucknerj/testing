@@ -199,8 +199,9 @@ pipeline {
                             pushd install-${name}
                             export CHARMM_DATA_DIR=\$(pwd)/toppar
                             cd tool/pycharmm
+                            rm -f pytest-results.xml
                             set +e
-                            nice -n 10 pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
+                            PYTHONFAULTHANDLER=1 nice -n 10 pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
                             pytest_rc=\${PIPESTATUS[0]}
                             echo ""
                             echo "pytest exit code: \$pytest_rc"
@@ -210,7 +211,9 @@ pipeline {
                         """)
                         echo "pytest returned ${rc}"
                         if (fileExists("install-${name}/tool/pycharmm/pytest-results.xml")) {
-                            junit "install-${name}/tool/pycharmm/pytest-results.xml"
+                            junit allowEmptyResults: true,
+                                  skipOldReports: true,
+                                  testResults: "install-${name}/tool/pycharmm/pytest-results.xml"
                         } else {
                             unstable("pytest for ${name} did not produce pytest-results.xml")
                         }
@@ -228,12 +231,15 @@ pipeline {
                     echo "Grading test results..."
                     sh """
                         ${PYTHON_SETUP}
+                        rm -f test-results.xml
                         export CHARMM_TEST_HOME=\${WORKSPACE}
                         python \${WORKSPACE}/testing/charmm-test grade \
                             --tol 0.0001 --xml test-results.xml \
                             ${testableNames}
                     """
-                    junit 'test-results.xml'
+                    junit allowEmptyResults: true,
+                          skipOldReports: true,
+                          testResults: 'test-results.xml'
                     echo "...finished grading"
                 }
             }

@@ -1115,11 +1115,19 @@ Format: ``<** c47test : testname **> Wed Apr 13 14:30:22 CDT 2026``
 Groups: (1) suite name, (2) test name, (3) remainder (timestamp).
 """
 
-NOISE_PATTERNS = ('Parallel load', 'New timer')
+NOISE_PATTERNS = (
+    'Parallel load',
+    'New timer',
+    'shmem: mmap',                # OpenMPI shmem warning (embeds varying PID)
+    'create_and_attach: unable',  # OpenMPI shmem follow-up (embeds varying PID)
+    'Revision unknown',           # CHARMM banner pre git-revision change
+    'Git commit ID',              # CHARMM banner with build-varying git SHA
+)
 """Diff line content patterns that are always ignored.
 
 These appear in diff output due to runtime-dependent messages
-and are not meaningful test differences.
+(OpenMPI startup warnings, CHARMM banner version line, etc.) and
+are not meaningful test differences.
 """
 
 

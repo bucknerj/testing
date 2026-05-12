@@ -1059,7 +1059,13 @@ def compare_line_pair(old_fields, new_fields, tol):
         b = b_raw if b_raw is not None else 0.0
 
         diff = abs(a - b)
-        denom = max(a, b)
+        # Use magnitude (not signed value) so the relative-error branch
+        # also applies to large negative numbers, e.g. CHARMM energies
+        # which are typically negative. A signed max() would yield a
+        # negative denom for two negative values, skipping the relative
+        # check and forcing absolute-error comparison — which is too
+        # strict for energies in the thousands.
+        denom = max(abs(a), abs(b))
         if denom > tol * tol:
             diff /= denom
         if diff > tol and denom > tol:

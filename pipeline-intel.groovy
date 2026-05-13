@@ -20,8 +20,12 @@ def runInBatches(Map jobs, int batchSize) {
 def ENV_SETUP = '''
     module use /home/bucknerj/modulefiles
     module load compiler/latest mkl/latest mpi/latest
-    export SCCDFTB_DATA=/home/bucknerj/src/jenkins/sccdftb_data
 '''
+
+// Mirrors satyr's SLURM test.bash: symlink sccdftb.dat into the test
+// CWD just before test.com runs (sccdftb config only). See
+// pipeline-dev.groovy for details.
+def SCCDFTB_DATA_DIR = '/home/bucknerj/src/jenkins/sccdftb_data'
 
 // Python environment (for charmm-test)
 def PYTHON_SETUP = '''
@@ -172,6 +176,8 @@ pipeline {
                     charmmConfigs.findAll { name, cfg ->
                         cfg.test != false && cfg.test_args && !cfg.gpus
                     }.each { name, cfg ->
+                        def sccdftbLink = (name == 'sccdftb') ?
+                            "ln -sf ${SCCDFTB_DATA_DIR}/sccdftb.dat sccdftb.dat" : ""
                         cpuTestJobs["Test ${name}"] = {
                             stage("Test ${name}") {
                                 echo "Testing ${name}..."
@@ -179,6 +185,7 @@ pipeline {
                                     ${ENV_SETUP}
                                     pushd install-${name}/test
                                     ${TEST_ROTATE}
+                                    ${sccdftbLink}
                                     nice -n 10 ./test.com ${cfg.test_args} output old/output &> test.log
                                     popd
                                 """

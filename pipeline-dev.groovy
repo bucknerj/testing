@@ -20,8 +20,16 @@ def ENV_SETUP = '''
     eval "$(/home/bucknerj/.local/bin/micromamba shell hook --shell zsh)"
     micromamba activate workshop
     export FFTW_HOME=$CONDA_PREFIX
-    export SCCDFTB_DATA=/home/bucknerj/src/jenkins/sccdftb_data
 '''
+
+// Mirrors satyr's SLURM test.bash: symlink sccdftb.dat into the test
+// CWD just before test.com runs, so SCCDFTB tests find it as
+// ./sccdftb.dat. Satyr does this only for the sccdftb config; we do
+// the same. No SCCDFTB_DATA env var is set on satyr — tests that
+// `genv sccdftbdir SCCDFTB_DATA` get an empty path and either rely on
+// the symlinked ./sccdftb.dat or fail later at file open. Mirroring
+// satyr keeps the two test environments comparable.
+def SCCDFTB_DATA_DIR = '/home/bucknerj/src/jenkins/sccdftb_data'
 
 // Shell snippet to rotate test output: saves current output as old/
 def TEST_ROTATE = '''
@@ -147,6 +155,8 @@ pipeline {
                     charmmConfigs.findAll { name, cfg ->
                         cfg.test != false && cfg.test_args && !cfg.gpus
                     }.each { name, cfg ->
+                        def sccdftbLink = (name == 'sccdftb') ?
+                            "ln -sf ${SCCDFTB_DATA_DIR}/sccdftb.dat sccdftb.dat" : ""
                         cpuTestJobs["Test ${name}"] = {
                             stage("Test ${name}") {
                                 echo "Testing ${name}..."
@@ -154,6 +164,7 @@ pipeline {
                                     ${ENV_SETUP}
                                     pushd install-${name}/test
                                     ${TEST_ROTATE}
+                                    ${sccdftbLink}
                                     nice -n 10 ./test.com ${cfg.test_args} output old/output &> test.log
                                     popd
                                 """

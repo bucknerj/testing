@@ -98,6 +98,63 @@ ln -s charmm-test charmm_test.py
 pdoc charmm_test -o docs/
 ```
 
+## Testing with Jenkins on morrison
+
+Three Jenkins pipelines run on `morrison`, one per build flavor, each
+defined by a Groovy file at the root of this repo:
+
+| Pipeline | File | Build flavor |
+|---|---|---|
+| `pipeline-dev` | `pipeline-dev.groovy` | dev branch, GNU + OpenMPI, ~13 feature configs |
+| `pipeline-stable` | `pipeline-stable.groovy` | stable branch, GNU + OpenMPI |
+| `pipeline-intel` | `pipeline-intel.groovy` | Intel compilers + Intel MPI |
+
+Each pipeline iterates over the configs returned by
+`charmm-test list --json`, builds each one into `install-<name>/`,
+runs the test.com suite, runs the pyCHARMM pytest suite (where
+applicable), and publishes JUnit XML to Jenkins. The grading step
+uses `charmm-test grade` with the same noise filters and tolerance
+as a local invocation.
+
+### Environment
+
+Jenkins pipelines activate the `workshop` micromamba env on morrison.
+Its specification lives at the repo root:
+
+| File | Purpose |
+|---|---|
+| `workshop-env.yaml` | Human-edited intent: channels and top-level packages with version constraints. Edit this when adding/removing dependencies. |
+| `workshop-env-lock.yaml` | Full snapshot of resolved versions and builds, refreshed after intentional env changes. Use this when you need an exact, reproducible state. |
+
+Recreate or sync the env on morrison:
+
+```bash
+# Fresh install
+micromamba env create -n workshop -f workshop-env.yaml
+
+# Update an existing env to match the spec
+micromamba install -n workshop -f workshop-env.yaml
+```
+
+After intentionally changing the env, refresh both files and commit
+them together:
+
+```bash
+micromamba env export -n workshop --from-history > workshop-env.yaml
+micromamba env export -n workshop                > workshop-env-lock.yaml
+```
+
+Version pins worth knowing about:
+
+- `cuda-version<13` — CUDA 13.x dropped support for Volta architecture
+  (sm_70), which is the Quadro GV100 on morrison. A bumped
+  `cuda-nvrtc` from CUDA 13.x will make OpenMM kernel JIT-compilation
+  fail with `invalid value for --gpu-architecture`.
+- `pytorch[build="cuda*"]`, `libtorch[build="cuda*"]`,
+  `openmm-torch[build="cuda*"]` — force the CUDA variants. Without
+  these, conda-forge may resolve to CPU-only builds even when CUDA is
+  available, silently changing test numerics.
+
 ## Grading
 
 `charmm-test grade` checks each test output for:

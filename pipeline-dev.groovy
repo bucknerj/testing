@@ -20,6 +20,7 @@ def ENV_SETUP = '''
     eval "$(/home/bucknerj/.local/bin/micromamba shell hook --shell zsh)"
     micromamba activate workshop
     export FFTW_HOME=$CONDA_PREFIX
+    export SCCDFTB_DATA=/home/bucknerj/src/jenkins/sccdftb_data
 '''
 
 // Shell snippet to rotate test output: saves current output as old/

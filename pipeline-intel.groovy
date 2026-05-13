@@ -20,6 +20,7 @@ def runInBatches(Map jobs, int batchSize) {
 def ENV_SETUP = '''
     module use /home/bucknerj/modulefiles
     module load compiler/latest mkl/latest mpi/latest
+    export SCCDFTB_DATA=/home/bucknerj/src/jenkins/sccdftb_data
 '''
 
 // Python environment (for charmm-test)

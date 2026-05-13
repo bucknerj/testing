@@ -1,49 +1,65 @@
 name: workshop
 channels:
 - conda-forge
-- nvidia/label/cuda-12.0.0
 dependencies:
+# python
+- python=3.12
+
+# build tools
 - binutils
 - cmake
-- cuda
-- cuda-cudart
-- cuda-cudart-dev
-- cuda-cudart-static
-- cuda-version<13
-- fftw
-- gcc=12.1
-- gfortran=12.1
-- gxx=12.1
-- ipyparallel
-- jsonpickle
-- junit-xml
-- jupyter
-- jupyter_client
-- jupyter_console
-- jupyter_core
-- jupyter_server
-- jupyterlab
-- jupyterlab_server
-- jupyterlab_widgets
-- jupytext
-- libtorch[build="cuda*"]
 - make
-- mpi4py
-- numpy
-- openbabel
-- openmm>=8.4
-- openmm-torch[build="cuda*"]
+- ninja
+
+# compilers — gcc, gxx, gfortran are kept in lockstep by conda-forge's
+# matching gcc_impl_linux-64 / gxx_impl_linux-64 / gfortran_impl_linux-64
+# version constraints, so listing them unpinned is sufficient.
+- gcc
+- gxx
+- gfortran
+
+# CUDA 12.9 toolkit
+# - cuda-version<13 pins us off CUDA 13.x which dropped support for
+#   Volta (sm_70). Quadro GV100 on morrison is sm_70.
+# - cuda-toolkit=12.9 is the conda-forge metapackage that pulls nvcc,
+#   headers, runtime libs, nvrtc, libdevice, etc. consistently.
+- cuda-version<13
+- cuda-toolkit=12.9
+
+# MPI
 - openmpi
+- mpi4py
+
+# Scientific libraries
+- fftw
+- numpy
+- scipy
 - pandas
-- pdoc
+
+# OpenMM stack — openmm package has CUDA support compiled in; the
+# cuda-version<13 pin above directs the solver to the cuda-12.9
+# compatible build automatically.
+- openmm>=8.4
+- openmm-torch[build='cuda*']
+
+# PyTorch stack with CUDA. The `build='cuda*'` selector is required;
+# conda-forge ships cpu_* and cuda_* build variants of these and the
+# CPU one will otherwise win in solves.
+- libtorch[build='cuda*']
+- pytorch[build='cuda*']
+
+# Testing
+- pytest
+- pytest-forked
+
+# Chemistry helpers used by pyCHARMM and tests
+- openbabel
 - propka
 - py3dmol
-- pytest
-- python=3.12
-- pytorch[build="cuda*"]
-- readline==8.2
+
+# Misc utilities used by scripts / tests
+- jsonpickle
+- junit-xml
 - requests
-- scipy
 - setuptools
 - sysroot_linux-64>=2.28
-

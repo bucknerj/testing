@@ -1128,6 +1128,7 @@ NOISE_PATTERNS = (
     'create_and_attach: unable',  # OpenMPI shmem follow-up (embeds varying PID)
     'Revision unknown',           # CHARMM banner pre git-revision change
     'Git commit ID',              # CHARMM banner with build-varying git SHA
+    'SET OMP_NUM_THREADS',        # prterun startup line (embeds varying PID)
 )
 """Diff line content patterns that are always ignored.
 

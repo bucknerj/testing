@@ -1129,12 +1129,39 @@ NOISE_PATTERNS = (
     'Revision unknown',           # CHARMM banner pre git-revision change
     'Git commit ID',              # CHARMM banner with build-varying git SHA
     'SET OMP_NUM_THREADS',        # prterun startup line (embeds varying PID)
+    # Timer / job-accounting fields whose numeric values vary run-to-run
+    # regardless of correctness.  Without these the grader treats a
+    # ' CPU TIME:  0.03' -> ' CPU TIME:  0.04' wobble as a real diff
+    # past the 1e-4 relative-tolerance threshold.
+    #
+    # Each pattern below is the most-specific substring that still
+    # uniquely identifies a timer row, anchored to the exact source
+    # format strings:
+    #
+    #   source/util/new_timer.F90 lines 240/244/312    -- block headers
+    #   source/util/new_timer.F90 lines 287/290/297/308 -- DOMDEC headers
+    #   source/util/new_timer.F90 lines 348-355         -- per-row rows
+    #   source/charmm/iniall.F90 lines 1037-1039        -- JOB ACCOUNTING
+    #   source/machdep/machutil.F90 line 140            -- one-line variant
+    '$$$$$$  New timer',
+    '$$$$$$  Average   profile',
+    ' Other: ',                   # per-row entries; specific column header
+    '$$$$$ JOB ACCOUNTING',
+    ' ELAPSED TIME:',
+    '     CPU TIME:',
+    ' CPU TIME=',
+    ' ELAPSED TIME=',
 )
 """Diff line content patterns that are always ignored.
 
 These appear in diff output due to runtime-dependent messages
-(OpenMPI startup warnings, CHARMM banner version line, etc.) and
+(OpenMPI startup warnings, CHARMM banner version line, timer /
+job-accounting rows whose numeric values vary per run, etc.) and
 are not meaningful test differences.
+
+Patterns are intentionally narrow -- each is anchored to the exact
+format string in CHARMM source so they cannot accidentally match
+scientific output that happens to mention the same words.
 """
 
 

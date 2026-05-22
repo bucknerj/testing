@@ -204,19 +204,34 @@ CONFIGS = {
         'description': 'RESIZE dynamic memory reallocation tests',
     },
     'tamd': {
-        # PIPF is included here so c33test/pipf_test3.inp (and any
-        # other PIPF tests that need a serial run) gets exercised
-        # somewhere in CI.  PIPF works fine in serial but has no MPI
-        # reductions in source/pipf/, so under multi-rank pipeline-dev
-        # configs (notably misc) the extended-Lagrangian dipole
-        # dynamics blows up after ~10 steps once each rank computes
-        # diverging dipole forces.  pipf_test3.inp carries an
-        # `if ?numnode .ne. 1 then ... stop endif` guard that
-        # self-skips on parallel configs; this serial config is where
-        # it actually runs.
-        'configure': f'--without-mpi -a TAMD,PIPF {PIP_LOCK}',
+        # PIPF and TMD are both included here so the tests that need
+        # them (c33test/pipf_test*.inp, c34test/pipf_vib.inp,
+        # c32test/tmd_zeta.inp) get exercised somewhere in CI.  Both
+        # features work fine in serial but have incomplete MPI
+        # parallel-correctness in CHARMM at the moment:
+        #
+        #   - PIPF: ``grep -nE 'GCOMB|VDGBR|MPI_REDUCE|PSND'
+        #     source/pipf/`` returns nothing, so under multi-rank
+        #     particle-decomposition each rank computes diverging
+        #     dipole forces and the dynamics SHAKE-fails within ~10
+        #     steps.
+        #
+        #   - TMD: ``grep -nE 'GCOMB|VDGBR|MPI_REDUCE|PSND'
+        #     source/dynamc/tmd.F90`` returns only a single
+        #     ``VDGBR(x,y,z,1)`` coord-broadcast with no reductions on
+        #     the restraint forces -- restraint forces diverge between
+        #     ranks and the dynamics explodes with a ~9x KE spike in
+        #     the first few steps.
+        #
+        # The corresponding tests carry
+        # ``if ?numnode .ne. 1 then ... stop endif`` guards that
+        # self-skip on parallel configs (pipf_test3.inp, tmd_zeta.inp);
+        # this serial config is where they actually run.  TAMD itself
+        # is the default-on temperature-accelerated-MD feature; it's
+        # listed here explicitly for clarity.
+        'configure': f'--without-mpi -a TAMD,PIPF,TMD {PIP_LOCK}',
         'test_args': 'cmake',
-        'description': 'Serial / no-MPI features (TAMD + PIPF)',
+        'description': 'Serial / no-MPI features (TAMD + PIPF + TMD)',
     },
 }
 """Build/test configurations.

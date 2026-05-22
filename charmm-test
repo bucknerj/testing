@@ -204,9 +204,19 @@ CONFIGS = {
         'description': 'RESIZE dynamic memory reallocation tests',
     },
     'tamd': {
-        'configure': f'--without-mpi -a TAMD {PIP_LOCK}',
+        # PIPF is included here so c33test/pipf_test3.inp (and any
+        # other PIPF tests that need a serial run) gets exercised
+        # somewhere in CI.  PIPF works fine in serial but has no MPI
+        # reductions in source/pipf/, so under multi-rank pipeline-dev
+        # configs (notably misc) the extended-Lagrangian dipole
+        # dynamics blows up after ~10 steps once each rank computes
+        # diverging dipole forces.  pipf_test3.inp carries an
+        # `if ?numnode .ne. 1 then ... stop endif` guard that
+        # self-skips on parallel configs; this serial config is where
+        # it actually runs.
+        'configure': f'--without-mpi -a TAMD,PIPF {PIP_LOCK}',
         'test_args': 'cmake',
-        'description': 'Temperature-accelerated MD (serial, no MPI)',
+        'description': 'Serial / no-MPI features (TAMD + PIPF)',
     },
 }
 """Build/test configurations.

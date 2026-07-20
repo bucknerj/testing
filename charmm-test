@@ -314,10 +314,10 @@ def test_script(name, test_args):
     sccdftb_link = ""
     if name == "sccdftb":
         sccdftb_link = (
-            '\n    # Link sccdftb data if needed\n'
-            '    if [[ ! -L "./sccdftb.dat" ]]; then\n'
-            '        ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat\n'
-            '    fi\n')
+            '\n        # Link sccdftb data if needed\n'
+            '        if [[ ! -L "./sccdftb.dat" ]]; then\n'
+            '            ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat\n'
+            '        fi\n')
 
     return textwrap.dedent(f"""\
         #!/bin/bash

@@ -171,6 +171,12 @@ CONFIGS = {
                      f"ENSEMBLE,SAMC,MCMA,GSBP,PIPF,POLAR,PNM,RISM,CONSPH,"
                      f"RUSH,TMD,DIMS,MSCALE,EDS {PIP_LOCK}",
         'test_args': 'M 2 X 2 cmake',
+        # MSCALE/EDS tests (mscale, mscalepert, vibran_mscale, eds) call
+        # MPI_Comm_spawn to launch subsystem CHARMM processes (mscale.inp uses
+        # `nsubs 3`).  Reserve extra Slurm slots so the spawned children have
+        # somewhere to land; without this they abort with "All nodes ...
+        # already filled".
+        'spawn_headroom': 6,
         'description': 'Miscellaneous keyword bundle (14 keywords)',
     },
     'misc2': {
@@ -671,6 +677,13 @@ def cmd_test(args, dependencies=None):
         # Standard test.com
         test_args = cfg.get('test_args', 'cmake')
         ntasks, cpus = parse_slurm_params(test_args)
+        # Some tests use MPI_Comm_spawn (MSCALE spawns `nsubs` subsystem
+        # CHARMM processes; EDS likewise).  test.com still launches the parent
+        # with `mpirun -np <ntasks>`, but the spawned children need free slots
+        # in the Slurm allocation or MPI_Comm_spawn fails with "All nodes ...
+        # already filled".  Over-allocate by 'spawn_headroom' slots for such
+        # configs; non-spawning tests just leave them idle.
+        alloc_ntasks = ntasks + cfg.get('spawn_headroom', 0)
         tdir = test_dir(name)
         tdir.mkdir(parents=True, exist_ok=True)
         output_path = f'{tdir}/%x-%j.out'
@@ -680,7 +693,7 @@ def cmd_test(args, dependencies=None):
             f'--time={SLURM_TEST_TIME}',
             f'--partition={SLURM_PARTITION}',
             '--nodes=1',
-            f'--ntasks-per-node={ntasks}',
+            f'--ntasks-per-node={alloc_ntasks}',
             f'--cpus-per-task={cpus}',
             f'--gres=gpu:{gpus}',
             '--export=NONE',

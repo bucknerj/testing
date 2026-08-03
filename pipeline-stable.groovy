@@ -182,13 +182,20 @@ pipeline {
                             pushd install-${name}
                             export CHARMM_DATA_DIR=\$(pwd)/toppar
                             cd tool/pycharmm
-                            rm -f pytest-results.xml
+                            # Use an absolute path for --junitxml so the
+                            # result lands in cwd regardless of where
+                            # pytest resolves its rootdir.  With a bare
+                            # filename + ``pytest tests/``, pytest puts
+                            # the XML under tests/, off-by-one from
+                            # where the post-step fileExists() looks.
+                            xml_path=\$(pwd)/pytest-results.xml
+                            rm -f "\$xml_path"
                             set +e
-                            PYTHONFAULTHANDLER=1 nice -n 10 pytest -v --tb=short --junitxml=pytest-results.xml tests/ 2>&1 | tee pytest.log
+                            PYTHONFAULTHANDLER=1 nice -n 10 pytest -v --tb=short --junitxml="\$xml_path" tests/ 2>&1 | tee pytest.log
                             pytest_rc=\${PIPESTATUS[0]}
                             echo ""
                             echo "pytest exit code: \$pytest_rc"
-                            ls -la pytest-results.xml 2>/dev/null || echo "WARNING: pytest-results.xml was not written (pytest likely crashed)"
+                            ls -la "\$xml_path" 2>/dev/null || echo "WARNING: pytest-results.xml was not written (pytest likely crashed)"
                             popd
                             exit \$pytest_rc
                         """)

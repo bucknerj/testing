@@ -51,7 +51,7 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                git branch: 'stable-release', url: 'gitlab:/bucknerj/dev-release'
+                git branch: 'stable-candidate', url: 'gitlab:/bucknerj/dev-release'
             }
         }
         stage('Checkout Testing') {

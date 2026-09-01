@@ -188,6 +188,21 @@ pipeline {
                             ${ENV_SETUP}
                             pushd install-${name}
                             export CHARMM_DATA_DIR=\$(pwd)/toppar
+                            # Pin the suite to THIS config's libchmm.  Every
+                            # config pip-installs pycharmm into the one shared
+                            # conda env, and loader.py has its library dir
+                            # substituted in by configure_file() at install
+                            # time -- so site-packages points at whichever
+                            # build ran `ninja install` last, across
+                            # pipeline-dev and pipeline-stable both.  Without
+                            # this the tests silently exercise some other
+                            # build: seen as test_mpi_usable_native_repdstr_
+                            # lifecycle failing with "REPlica DiSTRibuted code
+                            # not compiled" on install-gpu, which is built
+                            # --with-repdstr.  The constructor argument wins
+                            # over the baked-in default, and mpirun ranks
+                            # inherit it through the environment.
+                            export CHARMM_LIB_DIR=\$(pwd)/lib
                             cd tool/pycharmm
                             # Use an absolute path for --junitxml so the
                             # result lands in cwd regardless of where

@@ -335,8 +335,8 @@ def test_script(name, test_args):
             '            echo "WARNING: no $SCCDFTB_DATA/skf; sccdftb tests will fail"\n'
             '        fi\n'
             '        # Older testcases still want ./sccdftb.dat in the cwd\n'
-            '        if [[ ! -L "./sccdftb.dat" && -f "$SCCDFTB_DATA/sccdftb.dat" ]]; then\n'
-            '            ln -s "$SCCDFTB_DATA/sccdftb.dat" sccdftb.dat\n'
+            '        if [[ ! -e "./sccdftb.dat" && -f "$SCCDFTB_DATA/sccdftb.dat" ]]; then\n'
+            '            ln -s "$SCCDFTB_DATA/sccdftb.dat" sccdftb.dat || true\n'
             '        fi\n')
 
     return textwrap.dedent(f"""\

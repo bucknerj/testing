@@ -797,14 +797,81 @@ def cmd_status(args):
         print('\n'.join(relevant))
 
 
+def charmm_provenance():
+    """Describe the CHARMM checkout the outputs were produced from.
+
+    Returns a dict of branch/commit/subject, with 'unknown' for anything git
+    cannot answer.  Used to stamp a promoted benchmark: a bench directory is
+    otherwise just .out files, and the CHARMM banner inside them records a
+    version but not always a commit, so there is no way after the fact to say
+    what a benchmark actually represents.
+    """
+    info = {'branch': 'unknown', 'commit': 'unknown', 'subject': 'unknown',
+            'dirty': ''}
+    if not CHARMM_DIR.is_dir():
+        return info
+
+    def git(*args):
+        try:
+            r = subprocess.run(['git', '-C', str(CHARMM_DIR), *args],
+                               capture_output=True, text=True, check=False)
+            return r.stdout.strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
+    info['branch'] = git('rev-parse', '--abbrev-ref', 'HEAD') or 'unknown'
+    info['commit'] = git('rev-parse', 'HEAD') or 'unknown'
+    info['subject'] = git('log', '-1', '--format=%s') or 'unknown'
+    if git('status', '--porcelain', '--untracked-files=no'):
+        info['dirty'] = ' (working tree had uncommitted changes)'
+    return info
+
+
+def write_bench_provenance(bench, name, prov, predecessor):
+    """Record what a promoted benchmark is, inside the benchmark itself.
+
+    Written as PROVENANCE.txt so it travels with the bench and cannot be
+    separated from it.  Grading only ever reads ``*.out``, so this file is
+    inert as far as the comparison is concerned.
+    """
+    n_out = len(list(bench.glob('*.out')))
+    lines = [
+        f"config:       {name}",
+        f"promoted:     {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"branch:       {prov['branch']}",
+        f"commit:       {prov['commit']}{prov['dirty']}",
+        f"subject:      {prov['subject']}",
+        f"output files: {n_out}",
+        f"replaced:     {predecessor or '(no previous benchmark)'}",
+        "",
+        "Written by `charmm-test bench'.  Tests that self-report a result are",
+        "not compared against this benchmark at all, so their files here are",
+        "informational only; the comparison applies to tests that report",
+        "nothing.  Crashes are never masked by a benchmark -- grading settles",
+        "termination before it consults this directory.",
+    ]
+    try:
+        (bench / 'PROVENANCE.txt').write_text("\n".join(lines) + "\n")
+    except OSError as exc:
+        print(f"  {name:<12} warning: could not write PROVENANCE.txt ({exc})",
+              file=sys.stderr)
+
+
 def cmd_bench(args):
     """Promote test output to benchmark.
 
     For each config, renames ``output/`` to ``bench/`` in the test
     directory. If ``bench/`` already exists, it is backed up with
     a timestamp suffix (e.g. ``bench.20260413-143022``).
+
+    Each promoted benchmark gets a PROVENANCE.txt naming the branch, commit
+    and subject it was built from.
     """
     names = resolve_names(args.names, require_test=True)
+    prov = charmm_provenance()
+    print(f"  CHARMM: {prov['branch']} @ {prov['commit'][:9]}"
+          f"{prov['dirty']}  {prov['subject'][:56]}")
+    print()
 
     for name in names:
         tdir = test_dir(name)
@@ -816,12 +883,15 @@ def cmd_bench(args):
                   f" -- no output/ directory")
             continue
 
+        predecessor = ''
         if bench.is_dir():
             backup = tdir / f'bench.{datetime.now():%Y%m%d-%H%M%S}'
             bench.rename(backup)
+            predecessor = backup.name
             print(f"  {name:<12} backed up bench -> {backup.name}")
 
         output.rename(bench)
+        write_bench_provenance(bench, name, prov, predecessor)
         print(f"  {name:<12} {colored('OK', Color.PASS)} -- output/ -> bench/")
 
 
@@ -1344,6 +1414,80 @@ def get_elapsed_time(lines):
 
 # ─── Grade subcommand ─────────────────────────────────────────────
 
+def classify_output(tname, lines, rpt_data, tol, xfail):
+    """Decide the verdict for one testcase.  The single source of truth.
+
+    Returns ``(verdict, detail)`` with verdict one of ``'pass'``, ``'fail'``,
+    ``'error'``, ``'skip'``.
+
+    **The order below is load-bearing.  Do not rearrange it.**
+
+    1. on the xfail list                -> skip   (nothing else is examined)
+    2. no output at all                 -> error
+    3. ``ABNORMAL TERMINATION``         -> error
+    4. no ``TERMINATION`` line          -> error
+    5. ``RESULT: FAIL``                 -> fail
+    6. ``TESTCASE RESULT: SKIP`` etc.   -> skip
+    7. ``TESTCASE RESULT: PASS``        -> pass
+    8. numerical diff against the bench -> pass/fail
+
+    Two properties of that order matter and are easy to break:
+
+    * **Termination is settled before anything the test says about itself.**
+      A run that aborted is an error even if it printed PASS beforehand;
+      otherwise a test could crash after self-reporting and be scored a pass.
+      This is also why steps 2-4 look at the *current* output only and never
+      at the benchmark -- a crash cannot be masked by promoting it.
+    * **A self-reported PASS short-circuits: the diff is never consulted.**
+      Tests that report their own result are not compared against the bench
+      or the previous run, so their output may change freely.  Conversely, a
+      test that says nothing is graded *only* by the diff, which is why a
+      test with no self-check silently depends on captured values.
+
+    ``grep_output`` skips lines containing "echo", so a testcase echoing the
+    check commands does not trigger its own verdict.  Matching is
+    case-sensitive substring matching.
+    """
+    if tname in xfail:
+        return 'skip', 'expected failure'
+
+    if not lines:
+        return 'error', 'NO OUTPUT FILE'
+
+    abnormal = grep_output(lines, 'ABNORMAL TERMINATION')
+    if abnormal:
+        return 'error', abnormal[0]
+
+    if not grep_output(lines, 'TERMINATION'):
+        return 'error', 'NO TERMINATION'
+
+    fail_result = grep_output(lines, 'RESULT: FAIL')
+    if fail_result:
+        return 'fail', fail_result[0]
+
+    skips = (grep_output(lines, 'TESTCASE RESULT: SKIP') +
+             grep_output(lines, 'TEST NOT PERFORMED') +
+             grep_output(lines, 'test not performed'))
+    if skips:
+        return 'skip', 'self-reported skip'
+
+    if grep_output(lines, 'TESTCASE RESULT: PASS'):
+        return 'pass', 'self-reported pass'
+
+    # Only tests that said nothing about themselves reach the diff.
+    if rpt_data and rpt_data['hunks']:
+        all_bad = []
+        for old_lines, new_lines in rpt_data['hunks']:
+            passed, bad_pairs = compare_hunk(old_lines, new_lines, tol)
+            if not passed:
+                all_bad.extend(bad_pairs)
+        if all_bad:
+            return 'fail', (f'{len(all_bad)} numerical diff(s) '
+                            f'exceed tol={tol}')
+
+    return 'pass', ''
+
+
 def cmd_grade(args):
     """Grade test results with numerical tolerance comparison.
 
@@ -1419,56 +1563,19 @@ def cmd_grade(args):
         for tname in test_names:
             out_file = output_dir / f'{tname}.out'
             lines = read_lines(out_file)
-            elapsed = get_elapsed_time(lines)
 
-            if tname in xfail:
+            # One classifier for the whole tool; see classify_output().
+            verdict, detail = classify_output(
+                tname, lines, rpt.get(tname), tol, xfail)
+
+            if verdict == 'error':
+                config_errors.append((tname, detail))
+            elif verdict == 'fail':
+                config_fails.append((tname, detail))
+            elif verdict == 'skip':
                 config_skips.append(tname)
-                continue
-
-            if not lines:
-                config_errors.append((tname, 'NO OUTPUT FILE'))
-                continue
-
-            abnormal = grep_output(lines, 'ABNORMAL TERMINATION')
-            if abnormal:
-                config_errors.append((tname, abnormal[0]))
-                continue
-
-            if not grep_output(lines, 'TERMINATION'):
-                config_errors.append((tname, 'NO TERMINATION'))
-                continue
-
-            fail_result = grep_output(lines, 'RESULT: FAIL')
-            if fail_result:
-                config_fails.append((tname, fail_result[0]))
-                continue
-
-            skips = (grep_output(lines, 'TESTCASE RESULT: SKIP') +
-                     grep_output(lines, 'TEST NOT PERFORMED') +
-                     grep_output(lines, 'test not performed'))
-            if skips:
-                config_skips.append(tname)
-                continue
-
-            if grep_output(lines, 'TESTCASE RESULT: PASS'):
+            else:
                 config_pass += 1
-                continue
-
-            # Diff comparison
-            rpt_data = rpt.get(tname)
-            if rpt_data and rpt_data['hunks']:
-                all_bad = []
-                for old_lines, new_lines in rpt_data['hunks']:
-                    passed, bad_pairs = compare_hunk(old_lines, new_lines, tol)
-                    if not passed:
-                        all_bad.extend(bad_pairs)
-                if all_bad:
-                    detail = (f'{len(all_bad)} numerical diff(s) '
-                              f'exceed tol={tol}')
-                    config_fails.append((tname, detail))
-                    continue
-
-            config_pass += 1
 
         # Print summary line for this config
         total = len(test_names)

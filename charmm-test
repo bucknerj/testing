@@ -319,10 +319,25 @@ def test_script(name, test_args):
     """
     sccdftb_link = ""
     if name == "sccdftb":
+        # The testcases read SCCDFTB_DATA with `genv' and build a path to a
+        # per-element sccdftb_<ELEMENTS>.dat.  `genv' on an unset variable is a
+        # level-0 warning, which terminates at the default BOMLEV, so without
+        # the export every sccdftb test aborts two lines in with nothing about
+        # parameters in the message.  The .dat files name their .skf files by
+        # absolute path, so they are built here per host rather than checked in
+        # -- see sccdftb/README.md.
         sccdftb_link = (
-            '\n        # Link sccdftb data if needed\n'
-            '        if [[ ! -L "./sccdftb.dat" ]]; then\n'
-            '            ln -s "$HOME/testing/sccdftb_data/sccdftb.dat" sccdftb.dat\n'
+            '\n        export SCCDFTB_DATA="$HOME/testing/sccdftb_data"\n'
+            '        if [[ -d "$SCCDFTB_DATA/skf" ]]; then\n'
+            '            python3 "$HOME/testing/sccdftb/gen_sccdftb_dat.py" \\\n'
+            '                "$SCCDFTB_DATA/skf" "$SCCDFTB_DATA" || \\\n'
+            '                echo "WARNING: could not build sccdftb .dat files"\n'
+            '        else\n'
+            '            echo "WARNING: no $SCCDFTB_DATA/skf; sccdftb tests will fail"\n'
+            '        fi\n'
+            '        # Older testcases still want ./sccdftb.dat in the cwd\n'
+            '        if [[ ! -L "./sccdftb.dat" && -f "$SCCDFTB_DATA/sccdftb.dat" ]]; then\n'
+            '            ln -s "$SCCDFTB_DATA/sccdftb.dat" sccdftb.dat\n'
             '        fi\n')
 
     return textwrap.dedent(f"""\
@@ -901,9 +916,10 @@ def check_prereqs(verbose=False):
           f"Conda environment: {CONDA_ENV}",
           "Run setup.bash to create it")
 
-    warn((TESTING_HOME / 'sccdftb_data' / 'sccdftb.dat').is_file(),
-         "SCCDFTB data: sccdftb_data/sccdftb.dat",
-         "Only needed for the sccdftb config")
+    warn((TESTING_HOME / 'sccdftb_data' / 'skf').is_dir(),
+         "SCCDFTB parameters: sccdftb_data/skf/",
+         "Only needed for the sccdftb config; get the .skf set from "
+         "dftb.org and see sccdftb/README.md")
 
     if verbose:
         print()

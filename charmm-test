@@ -98,9 +98,8 @@ import subprocess
 import sys
 import textwrap
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-
 
 # ─── Configuration ─────────────────────────────────────────────────
 
@@ -486,6 +485,17 @@ def test_dir(name):
     return install_dir(name) / 'test'
 
 
+def local_now():
+    """Timezone-aware current local time.
+
+    The wall clock is the same as ``datetime.now()``; the explicit zone is
+    so the value carries its offset, since these timestamps name directories
+    and appear in a benchmark's PROVENANCE.txt, where a bare local time is
+    ambiguous six months later.
+    """
+    return datetime.now(timezone.utc).astimezone()
+
+
 def sbatch(args, script_body=None):
     """Submit a job to Slurm via sbatch.
 
@@ -502,7 +512,8 @@ def sbatch(args, script_body=None):
     result = subprocess.run(
         ['sbatch'] + args,
         input=script_body,
-        capture_output=True, text=True, cwd=str(TESTING_HOME))
+        capture_output=True, text=True, cwd=str(TESTING_HOME),
+        check=False)
     if result.returncode != 0:
         print(f"sbatch failed: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
@@ -530,24 +541,26 @@ def git_pull(branch=None):
         print(f"  Checking out branch: {branch}")
         result = subprocess.run(
             ['git', 'checkout', branch],
-            capture_output=True, text=True, cwd=str(CHARMM_DIR))
+            capture_output=True, text=True, cwd=str(CHARMM_DIR),
+            check=False)
         if result.returncode != 0:
             print(f"  Error: git checkout failed: {result.stderr.strip()}",
                   file=sys.stderr)
             sys.exit(1)
 
-    print(f"  Pulling latest CHARMM source...")
+    print("  Pulling latest CHARMM source...")
     result = subprocess.run(
         ['git', 'pull'],
-        capture_output=True, text=True, cwd=str(CHARMM_DIR))
+        capture_output=True, text=True, cwd=str(CHARMM_DIR),
+        check=False)
     if result.returncode != 0:
         print(f"  Warning: git pull failed: {result.stderr.strip()}",
               file=sys.stderr)
-        print(f"  Continuing with current source.", file=sys.stderr)
+        print("  Continuing with current source.", file=sys.stderr)
     else:
         output = result.stdout.strip()
         if 'Already up to date' in output:
-            print(f"  Already up to date.")
+            print("  Already up to date.")
         else:
             lines = output.split('\n')
             for line in lines[:3]:
@@ -778,7 +791,7 @@ def cmd_status(args):
     result = subprocess.run(
         ['squeue', '--me', '--format=%.10i %.12j %.8T %.10M %.6D %R',
          '--sort=j'],
-        capture_output=True, text=True)
+        capture_output=True, text=True, check=False)
     if result.returncode != 0:
         print(f"squeue failed: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
@@ -816,7 +829,7 @@ def charmm_provenance():
             r = subprocess.run(['git', '-C', str(CHARMM_DIR), *args],
                                capture_output=True, text=True, check=False)
             return r.stdout.strip() if r.returncode == 0 else ''
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return ''
 
     info['branch'] = git('rev-parse', '--abbrev-ref', 'HEAD') or 'unknown'
@@ -837,7 +850,7 @@ def write_bench_provenance(bench, name, prov, predecessor):
     n_out = len(list(bench.glob('*.out')))
     lines = [
         f"config:       {name}",
-        f"promoted:     {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"promoted:     {local_now():%Y-%m-%d %H:%M:%S %Z}",
         f"branch:       {prov['branch']}",
         f"commit:       {prov['commit']}{prov['dirty']}",
         f"subject:      {prov['subject']}",
@@ -885,7 +898,7 @@ def cmd_bench(args):
 
         predecessor = ''
         if bench.is_dir():
-            backup = tdir / f'bench.{datetime.now():%Y%m%d-%H%M%S}'
+            backup = tdir / f'bench.{local_now():%Y%m%d-%H%M%S}'
             bench.rename(backup)
             predecessor = backup.name
             print(f"  {name:<12} backed up bench -> {backup.name}")
@@ -903,7 +916,7 @@ def cmd_clean(args):
     each config's test directory.
     """
     names = resolve_names(args.names, require_test=True)
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    timestamp = local_now().strftime('%Y%m%d-%H%M%S')
 
     for name in names:
         tdir = test_dir(name)
@@ -1041,7 +1054,7 @@ def require_prereqs():
         print("Prerequisites not met:", file=sys.stderr)
         for msg in failures:
             print(f"  - {msg}", file=sys.stderr)
-        print(f"\nRun 'charmm-test prereqs' for full details.",
+        print("\nRun 'charmm-test prereqs' for full details.",
               file=sys.stderr)
         sys.exit(1)
 
@@ -1138,15 +1151,13 @@ def is_expected_diff(old_fields, new_fields):
             if f(fields, i) in ('99', '5'):
                 return True
 
-    if (f(old_fields, 2) == 'has' and f(new_fields, 2) == 'has'
+    # A "<n> has <m> ..." line whose surrounding fields all agree.
+    return (f(old_fields, 2) == 'has' and f(new_fields, 2) == 'has'
             and f(old_fields, 0) == f(new_fields, 0)
             and f(old_fields, 1) == f(new_fields, 1)
             and f(old_fields, 3) == f(new_fields, 3)
             and f(old_fields, 4) == f(new_fields, 4)
-            and f(old_fields, 5) == f(new_fields, 5)):
-        return True
-
-    return False
+            and f(old_fields, 5) == f(new_fields, 5))
 
 
 def compare_line_pair(old_fields, new_fields, tol):
@@ -1887,7 +1898,7 @@ def compute_deltas(current, previous):
 
 def summarize_results(results):
     """Return {'passed': N, 'failed': N, 'error': N, 'skipped': N, 'total': N}."""
-    summary = dict(passed=0, failed=0, error=0, skipped=0)
+    summary = {'passed': 0, 'failed': 0, 'error': 0, 'skipped': 0}
     for status, _msg, _elapsed in results.values():
         summary[status if status != 'error' else 'error'] += 1
     summary['total'] = sum(summary.values())
@@ -1900,7 +1911,7 @@ def per_config_summary(results):
     for full, (status, _msg, _elapsed) in results.items():
         suite = full.split('/', 1)[0]
         s = by_suite.setdefault(
-            suite, dict(passed=0, failed=0, error=0, skipped=0))
+            suite, {'passed': 0, 'failed': 0, 'error': 0, 'skipped': 0})
         s[status] = s.get(status, 0) + 1
     for suite, s in by_suite.items():
         s['total'] = sum(v for k, v in s.items() if k != 'total')
@@ -1990,7 +2001,7 @@ def render_markdown(current, previous, deltas, meta):
     lines.append(f"## ⚠️ Persistent Failures ({n_persist})")
     lines.append("")
     if n_persist:
-        lines.append(f"Tests failing in both this run and the previous.")
+        lines.append("Tests failing in both this run and the previous.")
         lines.append("")
         lines.append("<details><summary>Expand list</summary>")
         lines.append("")
@@ -2251,8 +2262,7 @@ def cmd_report(args):
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     # Use an explicit date from --date or today in local time
-    import datetime
-    date_stem = args.date or datetime.date.today().isoformat()
+    date_stem = args.date or local_now().date().isoformat()
 
     current = parse_junit_xml(xml_path)
     prev_xml = find_previous_xml(reports_dir, date_stem)
@@ -2269,8 +2279,9 @@ def cmd_report(args):
                  '--always', '--all', '--dirty'],
                 capture_output=True, text=True, check=False,
             ).stdout.strip() or 'unknown'
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  Warning: could not describe the CHARMM checkout: {exc}",
+              file=sys.stderr)
 
     configs = ', '.join(sorted({
         name.split('/', 1)[0] for name in current

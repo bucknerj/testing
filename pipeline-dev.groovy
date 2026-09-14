@@ -22,14 +22,33 @@ def ENV_SETUP = '''
     export FFTW_HOME=$CONDA_PREFIX
 '''
 
-// Mirrors satyr's SLURM test.bash: symlink sccdftb.dat into the test
-// CWD just before test.com runs, so SCCDFTB tests find it as
-// ./sccdftb.dat. Satyr does this only for the sccdftb config; we do
-// the same. No SCCDFTB_DATA env var is set on satyr — tests that
-// `genv sccdftbdir SCCDFTB_DATA` get an empty path and either rely on
-// the symlinked ./sccdftb.dat or fail later at file open. Mirroring
-// satyr keeps the two test environments comparable.
+// SCC-DFTB parameter setup, run in the test CWD just before test.com.
+// This is charmm-test's test_script() block for the sccdftb config,
+// transcribed: keeping the two hosts identical here is the whole point,
+// since anything that differs shows up as a difference in the grade.
+//
+// The testcases read SCCDFTB_DATA with `genv' and build a path to a
+// per-element sccdftb_<ELEMENTS>.dat. `genv' on an unset variable is a
+// level-0 warning, which terminates at the default BOMLEV, so without
+// the export they stop two lines in with nothing about parameters in
+// the message. The .dat files name their .skf files by absolute path,
+// so they are generated per host rather than checked in — see
+// sccdftb/README.md in the testing repo. Older testcases still want
+// ./sccdftb.dat in the CWD, which is what the symlink is for.
 def SCCDFTB_DATA_DIR = '/home/bucknerj/src/jenkins/sccdftb_data'
+def SCCDFTB_SETUP = """
+    export SCCDFTB_DATA=${SCCDFTB_DATA_DIR}
+    if [[ -d "\$SCCDFTB_DATA/skf" ]]; then
+        python3 \${WORKSPACE}/testing/sccdftb/gen_sccdftb_dat.py \\
+            "\$SCCDFTB_DATA/skf" "\$SCCDFTB_DATA" || \\
+            echo "WARNING: could not build sccdftb .dat files"
+    else
+        echo "WARNING: no \$SCCDFTB_DATA/skf; sccdftb tests will skip"
+    fi
+    if [[ ! -e ./sccdftb.dat && -f "\$SCCDFTB_DATA/sccdftb.dat" ]]; then
+        ln -s "\$SCCDFTB_DATA/sccdftb.dat" sccdftb.dat || true
+    fi
+"""
 
 // Shell snippet to rotate test output: saves current output as old/
 def TEST_ROTATE = '''
@@ -155,8 +174,7 @@ pipeline {
                     charmmConfigs.findAll { name, cfg ->
                         cfg.test != false && cfg.test_args && !cfg.gpus
                     }.each { name, cfg ->
-                        def sccdftbLink = (name == 'sccdftb') ?
-                            "ln -sf ${SCCDFTB_DATA_DIR}/sccdftb.dat sccdftb.dat" : ""
+                        def sccdftbSetup = (name == 'sccdftb') ? SCCDFTB_SETUP : ""
                         cpuTestJobs["Test ${name}"] = {
                             stage("Test ${name}") {
                                 echo "Testing ${name}..."
@@ -164,7 +182,7 @@ pipeline {
                                     ${ENV_SETUP}
                                     pushd install-${name}/test
                                     ${TEST_ROTATE}
-                                    ${sccdftbLink}
+                                    ${sccdftbSetup}
                                     nice -n 10 ./test.com ${cfg.test_args} output old/output &> test.log
                                     popd
                                 """

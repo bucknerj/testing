@@ -50,6 +50,14 @@ ZETA = "4.00"
 # Element order as the testcases spell it in the filename.  Only sets whose
 # elements are all in HUBBARD and whose .skf pairs are all present get written.
 WANTED = {
+    # O,N,C,H -- what 16 of the 19 testcases naming this file actually declare.
+    # The three that do not are given files of their own below, so this name no
+    # longer has to mean different things to different readers.
+    "sccdftb_ONCH.dat": ["O", "N", "C", "H"],
+    # c39test/dxl_bomd_test1 numbers its atoms C,H,N,O.
+    "sccdftb_CHNO.dat": ["C", "H", "N", "O"],
+    # c32test/sccgsbp4_2cba declares five types, the fifth being Zn.
+    "sccdftb_ONCHZN.dat": ["O", "N", "C", "H", "Zn"],
     "sccdftb_CHO.dat":  ["C", "H", "O"],
     "sccdftb_OH.dat":   ["O", "H"],
     "sccdftb_CH.dat":   ["C", "H"],
@@ -61,19 +69,6 @@ WANTED = {
 UNSUPPORTED = {
     "sccdftb_CHQ.dat": "needs a Q species for QQ* link atoms",
     "sccdftb_CH_spin.dat": "needs mio-1-1 plus spin constants",
-    # NOT generated on purpose.  Nineteen testcases read this one name and
-    # they do not agree on what should be in it: c39test/dxl_bomd_test1
-    # numbers its atoms C,H,N,O rather than O,N,C,H; c40test/sccdftb_cpe
-    # declares only two types (O,H), so it would read the first four path
-    # lines as a 2x2 table; and c32test/sccgsbp4_2cba declares five, the
-    # fifth being Zn.  CHARMM takes the count from WMAIN and indexes this
-    # list by it, so a file that suits one of them silently assigns the
-    # wrong element for every atom in the others -- the run completes and
-    # the numbers are simply wrong.  Serving the fifteen that do agree is
-    # not worth introducing that for the rest; the fix is to give each
-    # testcase a file matching its own WMAIN order.
-    "sccdftb_ONCH.dat": "19 testcases disagree on its element order and "
-                        "count; see README.md",
 }
 
 # gettab.f declares `character*64 skfile', so a longer path is truncated and

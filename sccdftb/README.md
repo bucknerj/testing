@@ -75,32 +75,30 @@ wrong element to every atom.
 
 | file | needed by | why not |
 | --- | --- | --- |
-| `sccdftb_ONCH.dat` | 19 testcases | **they disagree about what belongs in it** — see below |
 | `sccdftb_CHQ.dat` | `c34test/sccdftb_qmmm` | needs a `Q` species for the `QQ*` link atoms |
 | `sccdftb_CH_spin.dat` | `c37test/sccdftb_spin-qmmm` | needs spin constants (`spin-c`, `spin-h`); the test's own comment specifies mio-1-1, not 3ob |
 | (l-dependent) | `c39test/sccdftb_ldep` | needs l-dependent Hubbard values and spin constants for **Cu**, which is not in the 3ob set at all |
 
-### Why `sccdftb_ONCH.dat` is deliberately not generated
+### One shared filename, resolved
 
-Nineteen testcases read that one filename and do not agree on its contents:
+`sccdftb_ONCH.dat` used to be unservable because nineteen testcases named it and
+disagreed about its contents — CHARMM takes the element count from `WMAIN` and
+indexes the parameter list by it, so one file would have run three of them to
+completion with the wrong element on every atom.
 
-| testcase | declares | wants |
+Sixteen do declare O,N,C,H once read carefully (`scc_fep_dtsc`'s FO/FN/FC/FH
+are dual-topology counterparts sharing indices with O/N/C/H; the `sccpb_*` pair
+reuse `WMAIN` for Poisson-Boltzmann radii only after the SCC-DFTB assignment;
+`sccgsbp1/2/3_2cba` never invoke SCCDFTB at all). The three real exceptions now
+name their own file:
+
+| testcase | declares | reads |
 | --- | --- | --- |
-| `c33test/h4o2_*`, `c30test/neb_scc`, `c30test/split_scc`, and 12 others | 4 types | O, N, C, H — matches the name |
-| `c39test/dxl_bomd_test1` | 4 types | **C, H, N, O** |
-| `c40test/sccdftb_cpe` | **2 types** | O, H |
-| `c32test/sccgsbp4_2cba` | **5 types** | O, N, C, H, **Zn** |
+| `c40test/sccdftb_cpe` | O, H | `sccdftb_OH.dat` |
+| `c39test/dxl_bomd_test1` | C, H, N, O | `sccdftb_CHNO.dat` |
+| `c32test/sccgsbp4_2cba` | O, N, C, H, Zn | `sccdftb_ONCHZN.dat` |
 
-CHARMM takes the type count from `WMAIN` and indexes this list by it. A file
-that suits the first group is read by `sccdftb_cpe` as a 2x2 table off the
-first four path lines, and by `sccgsbp4_2cba` as missing an element — and
-neither says so. The run finishes and the numbers are quietly wrong, which is
-worse than the abort we have today.
-
-Fifteen tests would be served correctly, but not at the price of silently wrong
-physics in the other four. The fix is to give each testcase a file matching its
-own `WMAIN` order — most cleanly by having each one name a file it owns, rather
-than nineteen sharing one name.
+So the name means one thing again and is generated normally.
 
 `test/data/*.sccdftbdat` in the CHARMM tree holds the authors' original examples
 for several of these, including the spin constants — but they reference `.spl`

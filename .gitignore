@@ -11,3 +11,7 @@ slurm-*.out
 *.log
 *.json
 *.xml
+
+# Python bytecode
+__pycache__/
+*.pyc

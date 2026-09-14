@@ -189,9 +189,14 @@ CONFIGS = {
         'description': 'MNDO97 semi-empirical QM/MM',
     },
     'sccdftb': {
-        'configure': f'--with-sccdftb {PIP_LOCK}',
+        # GSBP is off by default and lived only in `misc', which has no
+        # SCC-DFTB, so c32test/sccgsbp{1,2,3,4}_2cba.inp self-skipped with
+        # "GSBP Test NOT performed" in every config that existed -- four
+        # testcases that had never run anywhere.  They are SCC-DFTB/GSBP
+        # QM/MM boundary tests and this is the only config that can run them.
+        'configure': f'--with-sccdftb -a GSBP {PIP_LOCK}',
         'test_args': 'cmake',
-        'description': 'SCC-DFTB tight-binding DFT',
+        'description': 'SCC-DFTB tight-binding DFT (+ GSBP)',
     },
     'squantm': {
         'configure': f'--with-squantm {PIP_LOCK}',

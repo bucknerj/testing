@@ -1383,7 +1383,7 @@ def read_lines(filepath):
         return []
 
 
-def grep_output(lines, pattern):
+def grep_output(lines, pattern, ignore_case=False):
     """Search lines for a pattern, excluding echo and comment lines.
 
     This prevents matching CHARMM input script echo statements
@@ -1392,13 +1392,19 @@ def grep_output(lines, pattern):
     Args:
         lines: List of text lines to search.
         pattern: Substring to match.
+        ignore_case: Match without regard to case.  Needed for the
+            self-skip announcements, which testcases write as a *quoted*
+            string -- CHARMM's ``echo`` upcases only unquoted text, so what
+            reaches the output is whatever capitalisation the author used.
 
     Returns:
         List of stripped matching lines.
     """
     matches = []
+    needle = pattern.casefold() if ignore_case else pattern
     for line in lines:
-        if pattern in line:
+        haystack = line.casefold() if ignore_case else line
+        if needle in haystack:
             lower = line.strip().casefold()
             if 'echo' not in lower and not lower.startswith('!'):
                 matches.append(line.strip())
@@ -1476,9 +1482,13 @@ def classify_output(tname, lines, rpt_data, tol, xfail):
     if fail_result:
         return 'fail', fail_result[0]
 
+    # "Test NOT performed" is written as a quoted echo in ~430 testcases and
+    # reaches the output with the author's own capitalisation, so match it
+    # without regard to case.  The two fixed spellings this replaces caught
+    # almost none of them: those tests were falling through to the numerical
+    # comparison and passing because the benchmark held the same message.
     skips = (grep_output(lines, 'TESTCASE RESULT: SKIP') +
-             grep_output(lines, 'TEST NOT PERFORMED') +
-             grep_output(lines, 'test not performed'))
+             grep_output(lines, 'test not performed', ignore_case=True))
     if skips:
         return 'skip', 'self-reported skip'
 

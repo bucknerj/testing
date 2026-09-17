@@ -22,10 +22,28 @@ def ENV_SETUP = '''
     export FFTW_HOME=$CONDA_PREFIX
 '''
 
-// Mirrors satyr's SLURM test.bash: symlink sccdftb.dat into the test
-// CWD just before test.com runs (sccdftb config only). See
-// pipeline-dev.groovy for details.
+// SCC-DFTB parameter setup, run in the test CWD just before test.com.
+// Identical to pipeline-dev.groovy and to charmm-test's own sccdftb test
+// job; keeping the hosts the same here is the point, since anything that
+// differs shows up as a difference in the grade.  See pipeline-dev.groovy
+// for why the export matters (`genv' on an unset SCCDFTB_DATA is a level-0
+// warning, so the testcases stop two lines in) and sccdftb/README.md for
+// why the .dat files are generated per host rather than checked in.  The
+// symlink is for older testcases that still want ./sccdftb.dat in the CWD.
 def SCCDFTB_DATA_DIR = '/home/bucknerj/src/jenkins/sccdftb_data'
+def SCCDFTB_SETUP = """
+    export SCCDFTB_DATA=${SCCDFTB_DATA_DIR}
+    if [[ -d "\$SCCDFTB_DATA/skf" ]]; then
+        python3 \${WORKSPACE}/testing/sccdftb/gen_sccdftb_dat.py \\
+            "\$SCCDFTB_DATA/skf" "\$SCCDFTB_DATA" || \\
+            echo "WARNING: could not build sccdftb .dat files"
+    else
+        echo "WARNING: no \$SCCDFTB_DATA/skf; sccdftb tests will skip"
+    fi
+    if [[ ! -e ./sccdftb.dat && -f "\$SCCDFTB_DATA/sccdftb.dat" ]]; then
+        ln -s "\$SCCDFTB_DATA/sccdftb.dat" sccdftb.dat || true
+    fi
+"""
 
 // Shell snippet to rotate test output: saves current output as old/
 def TEST_ROTATE = '''
@@ -151,8 +169,7 @@ pipeline {
                     charmmConfigs.findAll { name, cfg ->
                         cfg.test != false && cfg.test_args && !cfg.gpus
                     }.each { name, cfg ->
-                        def sccdftbLink = (name == 'sccdftb') ?
-                            "ln -sf ${SCCDFTB_DATA_DIR}/sccdftb.dat sccdftb.dat" : ""
+                        def sccdftbSetup = (name == 'sccdftb') ? SCCDFTB_SETUP : ""
                         cpuTestJobs["Test ${name}"] = {
                             stage("Test ${name}") {
                                 echo "Testing ${name}..."
@@ -160,7 +177,7 @@ pipeline {
                                     ${ENV_SETUP}
                                     pushd install-${name}/test
                                     ${TEST_ROTATE}
-                                    ${sccdftbLink}
+                                    ${sccdftbSetup}
                                     nice -n 10 ./test.com ${cfg.test_args} output old/output &> test.log
                                     popd
                                 """

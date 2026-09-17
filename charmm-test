@@ -252,9 +252,18 @@ Each entry is a dict with:
 - **test_args** (str, optional): Arguments for ``test.com``. The word
   ``output`` is appended automatically. ``M N`` sets MPI ranks to N,
   ``X T`` sets threads per rank to T. Absent means no test suite.
-- **gpus** (int, optional): Number of GPUs to request. Omit it for a
-  CPU-only config: no GPU is requested and the job is sent to
-  `SLURM_CPU_PARTITION` instead of waiting for a device it will not use.
+- **gpus** (int, optional): Number of GPUs to request. Omitting it asks
+  for none and sends the job to `SLURM_CPU_PARTITION`.
+
+  That is a decision, not a statement of fact. OpenMM is on by default
+  (see CHARMM's ``configure``), so every config here builds it and every
+  test sweep includes the 47 ``omm*`` testcases and 11 blade ones. In a
+  config that asks for no GPU those run without one of their own: the 12
+  that gate on ``?NGPU`` skip themselves, and the rest fall back to
+  whatever platform they can get. Only `gpu` and `gpu2` ask for devices,
+  because they are the two whose results we read as GPU results. If an
+  OpenMM number starts mattering in another config, give that config a
+  `gpus` count rather than relying on a device happening to be visible.
 - **pytest** (bool, optional): If ``True``, also run pyCHARMM pytest
   suite against this build (in addition to ``test.com``).
 - **test** (bool, optional): Set ``False`` for build-only configs.
@@ -285,9 +294,19 @@ def slurm_placement(gpus, override=None):
     Asking for a GPU the job will not touch means queueing for one. ada5000
     and ada6000 run with every GPU allocated most of the time -- 40 jobs
     running and 9 waiting, when this was written -- while the CPU nodes next
-    to them sit idle. A build never touches a device (nvcc does not need one
-    to compile), and only the configs that declare `gpus` run anything on
-    one, so everything else belongs on a CPU node.
+    to them sit idle.
+
+    A build never touches a device. Slurm really does mask them (with no
+    --gres, CUDA_VISIBLE_DEVICES is unset and nvidia-smi reports none), and
+    nvcc compiles and links CUDA anyway: it needs the toolkit, which is in
+    the conda env, not the driver. Architectures are chosen from
+    CUDAToolkit_VERSION_MAJOR rather than probed from a device, and the one
+    program run at configure time only asks libOpenMM for its version
+    string. So builds go to the CPU partition.
+
+    Test jobs get what their config declares, which is `gpu' and `gpu2'
+    only -- see the `gpus' note in the CONFIGS docstring for what that costs
+    the OpenMM testcases elsewhere.
 
     Args:
         gpus: GPUs this job actually uses; 0 asks for none.

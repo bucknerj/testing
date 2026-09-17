@@ -252,8 +252,9 @@ Each entry is a dict with:
 - **test_args** (str, optional): Arguments for ``test.com``. The word
   ``output`` is appended automatically. ``M N`` sets MPI ranks to N,
   ``X T`` sets threads per rank to T. Absent means no test suite.
-- **gpus** (int, optional): Number of GPUs to request. Defaults to
-  `SLURM_DEFAULT_GPUS`.
+- **gpus** (int, optional): Number of GPUs to request. Omit it for a
+  CPU-only config: no GPU is requested and the job is sent to
+  `SLURM_CPU_PARTITION` instead of waiting for a device it will not use.
 - **pytest** (bool, optional): If ``True``, also run pyCHARMM pytest
   suite against this build (in addition to ``test.com``).
 - **test** (bool, optional): Set ``False`` for build-only configs.
@@ -262,8 +263,11 @@ Each entry is a dict with:
 
 # ─── Slurm defaults ───────────────────────────────────────────────
 
-SLURM_PARTITION = 'ada5000'
-"""Slurm partition for all jobs."""
+SLURM_CPU_PARTITION = 'cpu'
+"""Partition for jobs that need no GPU."""
+
+SLURM_GPU_PARTITION = 'ada5000'
+"""Partition for jobs that do need a GPU."""
 
 SLURM_BUILD_TIME = '4:00:00'
 """Wall-time limit for build jobs."""
@@ -274,8 +278,30 @@ SLURM_TEST_TIME = '4:00:00'
 SLURM_BUILD_CPUS = 4
 """CPUs per build job (used for ``ninja -j``)."""
 
-SLURM_DEFAULT_GPUS = 1
-"""Default GPU count when not specified per-config."""
+
+def slurm_placement(gpus, override=None):
+    """Partition and GPU request for a job that needs `gpus` GPUs.
+
+    Asking for a GPU the job will not touch means queueing for one. ada5000
+    and ada6000 run with every GPU allocated most of the time -- 40 jobs
+    running and 9 waiting, when this was written -- while the CPU nodes next
+    to them sit idle. A build never touches a device (nvcc does not need one
+    to compile), and only the configs that declare `gpus` run anything on
+    one, so everything else belongs on a CPU node.
+
+    Args:
+        gpus: GPUs this job actually uses; 0 asks for none.
+        override: Partition named on the command line, if any. Wins over
+            both defaults, so a run can be aimed at whatever is idle today.
+
+    Returns:
+        List of sbatch arguments.
+    """
+    partition = override or (SLURM_GPU_PARTITION if gpus else SLURM_CPU_PARTITION)
+    args = [f'--partition={partition}']
+    if gpus:
+        args.append(f'--gres=gpu:{gpus}')
+    return args
 
 
 # ─── Embedded Slurm job scripts ───────────────────────────────────
@@ -664,10 +690,9 @@ def cmd_build(args):
         sbatch_args = [
             f'--job-name={name}-build',
             f'--time={SLURM_BUILD_TIME}',
-            f'--partition={SLURM_PARTITION}',
+            *slurm_placement(0, getattr(args, 'partition', None)),
             '--nodes=1', '--ntasks-per-node=1',
             f'--cpus-per-task={SLURM_BUILD_CPUS}',
-            f'--gres=gpu:{SLURM_DEFAULT_GPUS}',
             '--export=NONE',
             f'--output={idir}/%x-%j.out',
         ]
@@ -705,7 +730,7 @@ def cmd_test(args, dependencies=None):
 
     for name in names:
         cfg = CONFIGS[name]
-        gpus = cfg.get('gpus', SLURM_DEFAULT_GPUS)
+        gpus = cfg.get('gpus', 0)
 
         # Standard test.com
         test_args = cfg.get('test_args', 'cmake')
@@ -724,11 +749,10 @@ def cmd_test(args, dependencies=None):
         sbatch_args = [
             f'--job-name={name}-test',
             f'--time={SLURM_TEST_TIME}',
-            f'--partition={SLURM_PARTITION}',
+            *slurm_placement(gpus, getattr(args, 'partition', None)),
             '--nodes=1',
             f'--ntasks-per-node={alloc_ntasks}',
             f'--cpus-per-task={cpus}',
-            f'--gres=gpu:{gpus}',
             '--export=NONE',
             f'--output={output_path}',
         ]
@@ -752,11 +776,10 @@ def cmd_test(args, dependencies=None):
             pytest_sbatch = [
                 f'--job-name={name}-pytest',
                 f'--time={SLURM_TEST_TIME}',
-                f'--partition={SLURM_PARTITION}',
+                *slurm_placement(gpus, getattr(args, 'partition', None)),
                 '--nodes=1',
                 '--ntasks-per-node=1',
                 '--cpus-per-task=1',
-                f'--gres=gpu:{gpus}',
                 '--export=NONE',
                 f'--output={pytest_output}',
             ]
@@ -2355,6 +2378,10 @@ def main():
     # build
     p = sub.add_parser('build', help='submit build jobs')
     p.add_argument('names', nargs='*', help='config names (default: all)')
+    p.add_argument('--partition',
+                   help='Slurm partition (default: whichever of '
+                        f'{SLURM_CPU_PARTITION}/{SLURM_GPU_PARTITION} the '
+                        'job needs)')
     p.add_argument('--branch', help='git branch to check out before building')
     p.add_argument('--no-pull', action='store_true',
                    help='skip git pull before building')
@@ -2362,11 +2389,19 @@ def main():
     # test
     p = sub.add_parser('test', help='submit test jobs')
     p.add_argument('names', nargs='*', help='config names (default: all)')
+    p.add_argument('--partition',
+                   help='Slurm partition (default: whichever of '
+                        f'{SLURM_CPU_PARTITION}/{SLURM_GPU_PARTITION} the '
+                        'job needs)')
 
     # run (build + test chained)
     p = sub.add_parser('run',
                        help='build then test (chained via Slurm deps)')
     p.add_argument('names', nargs='*', help='config names (default: all)')
+    p.add_argument('--partition',
+                   help='Slurm partition (default: whichever of '
+                        f'{SLURM_CPU_PARTITION}/{SLURM_GPU_PARTITION} each '
+                        'job needs)')
     p.add_argument('--branch', help='git branch to check out before building')
     p.add_argument('--no-pull', action='store_true',
                    help='skip git pull before building')

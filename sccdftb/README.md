@@ -78,6 +78,36 @@ wrong element to every atom.
 | `sccdftb_CHQ.dat` | `c34test/sccdftb_qmmm` | needs a `Q` species for the `QQ*` link atoms |
 | `sccdftb_CH_spin.dat` | `c37test/sccdftb_spin-qmmm` | needs spin constants (`spin-c`, `spin-h`); the test's own comment specifies mio-1-1, not 3ob |
 | (l-dependent) | `c39test/sccdftb_ldep` | needs l-dependent Hubbard values and spin constants for **Cu**, which is not in the 3ob set at all |
+| `sccdftb_ONCH_hbond.dat` | `c33test/h4o2_hbond` | needs the H-bond correction parameter `kl1` |
+| `sccdftb_CHO_hbond.dat` | `c43test/malon_nbo` | likewise |
+| `sccdftb_OH_hbond.dat` | `c40test/sccdftb_cpe` | likewise |
+| `sccdftb_OCPH_dhga.dat` | `c37test/sccdftb_cdko` | needs the three Gaussian parameters for the Hubbard derivative |
+
+### The two constants behind four of those
+
+`dylcao.F` reads optional records from the **end** of the parameter file, one
+group per option, after the Hubbard derivatives:
+
+```fortran
+if (luhgau) read(4,*) v0_hgau,alp_hgau,q0_hgau   ! DHGA
+if (lscchb) read(4,*) kl1                        ! HBOND
+```
+
+Neither is written here, so a testcase that asks for those options reads off
+the end of its file and dies part way through with no termination line. The
+four testcases above name files of their own so the absence shows up as a skip
+instead.
+
+Supplying them is a parameter question, not a formatting one. The authors'
+example for DHGA, `test/data/sccdftb_cdko.sccdftbdat` in the CHARMM tree, ends
+with `-0.09`, `16.1`, `0.75` — but pairs them with its own older Hubbard
+derivatives (O −0.22, C −0.24) rather than 3ob's (O −0.1575, C −0.1492), and
+whether those constants carry across sets is for whoever owns the parameters
+to say. No file anywhere in the tree carries a `kl1` at all.
+
+`c36test/sccpb_chdr_new` is the same shape without a parameter file involved:
+it reads charge-dependent radii from `chrg_radius_scc.dat`, which does not
+exist anywhere in the CHARMM tree.
 
 ### One shared filename, resolved
 

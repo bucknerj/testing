@@ -165,7 +165,7 @@ done
 # ---- 3. grade and report --------------------------------------------------
 sacct -j "$jobs" -n -X -o jobname%20,partition%10,state%12,elapsed > "$run/jobs.txt" 2>/dev/null
 $CT grade --quiet --xml "$run/grade.xml" > "$run/grade.txt" 2>&1
-$CT report --xml "$run/grade.xml" --date "$stamp" > "$run/report.log" 2>&1
+$CT report "$run/grade.xml" --date "$stamp" > "$run/report.log" 2>&1
 report=$T/reports/$stamp.md
 
 {

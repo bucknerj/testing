@@ -61,11 +61,15 @@ if ! flock -n 9; then log "another nightly run holds the lock; nothing done"; ex
 
 # cron starts with a bare environment; charmm-test needs the conda env and
 # Slurm on the PATH.
+# The system profile and conda's hooks read unset variables, so -u is off
+# while they run.
+set +u
 # shellcheck disable=SC1091
 . /etc/profile >/dev/null 2>&1
 module load anaconda/miniconda-latest >/dev/null 2>&1 || module load anaconda/miniconda-latest >/dev/null 2>&1
 eval "$(conda shell.bash hook)"
 conda activate "$T/env/test"
+set -u
 CT="$T/env/test/bin/python $T/charmm-test"
 
 send() {  # subject, body file

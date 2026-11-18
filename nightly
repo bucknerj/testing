@@ -1,0 +1,194 @@
+#!/bin/bash
+# Nightly CHARMM test run, meant for cron on the gollum login node.
+#
+#   nightly [--force] [--dry-run]
+#
+# What it does, in order:
+#   1. Fetches master and stops, saying so in the log, if it is the commit
+#      the last nightly run tested.  --force runs anyway.
+#   2. Picks Slurm partitions by looking at the queues now (see
+#      pick_partition): the candidate with the fewest pending jobs wins.
+#   3. Archives the old outputs, then builds and tests every configuration
+#      with charmm-test, and waits for the jobs.
+#   4. Grades against the benchmark, writes the report with charmm-test
+#      report (regressions and fixes against the previous report), and
+#      mails it if MAILTO is set.
+#
+# It never touches the benchmark.  See "Benchmark policy" in README.md.
+#
+# Settings come from ~/testing/nightly.conf (bash, optional):
+#   MAILTO=you@example.org          where the report goes; unset = no mail
+#   REMOTE=origin                   what to fetch master from: a remote name
+#                                   or a URL.  A URL with a token belongs in
+#                                   this file, which should be mode 600.
+#   CPU_PARTITIONS="cpu gpuA5500"   candidates for jobs that need no GPU
+#   GPU_PARTITIONS="gpuA5500 gpu2080 ada5000 ada6000"
+#   MAX_WAIT_HOURS=10
+#
+# cron entry (02:15 every night):
+#   15 2 * * * $HOME/testing/nightly >> $HOME/testing/nightly-state/cron.log 2>&1
+
+set -u
+T=$HOME/testing
+STATE=$T/nightly-state
+CONF=$T/nightly.conf
+mkdir -p "$STATE"
+
+MAILTO=
+REMOTE=origin
+CPU_PARTITIONS="cpu gpuA5500"
+GPU_PARTITIONS="gpuA5500 gpu2080 ada5000 ada6000"
+MAX_WAIT_HOURS=10
+GPU_CONFIGS="gpu gpu2"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+FORCE=0; DRY=0
+for a in "$@"; do
+  case $a in
+    --force) FORCE=1 ;;
+    --dry-run) DRY=1 ;;
+    *) echo "usage: nightly [--force] [--dry-run]"; exit 2 ;;
+  esac
+done
+
+log() { echo "$(date '+%F %T') $*"; }
+
+# One run at a time: a second cron firing while a run is still waiting on
+# its jobs would archive the outputs out from under it.
+exec 9> "$STATE/lock"
+if ! flock -n 9; then log "another nightly run holds the lock; nothing done"; exit 0; fi
+
+# cron starts with a bare environment; charmm-test needs the conda env and
+# Slurm on the PATH.
+# shellcheck disable=SC1091
+. /etc/profile >/dev/null 2>&1
+module load anaconda/miniconda-latest >/dev/null 2>&1 || module load anaconda/miniconda-latest >/dev/null 2>&1
+eval "$(conda shell.bash hook)"
+conda activate "$T/env/test"
+CT="$T/env/test/bin/python $T/charmm-test"
+
+send() {  # subject, body file
+  [ -n "$MAILTO" ] || { log "MAILTO not set; report not mailed"; return; }
+  mail -s "$1" "$MAILTO" < "$2" && log "mailed to $MAILTO: $1"
+}
+
+fail() {  # message: log it, mail it, stop
+  log "FAILED: $*"
+  echo "$*" > "$STATE/failure.txt"
+  send "[CHARMM nightly] did not run: $*" "$STATE/failure.txt"
+  exit 1
+}
+
+# Fewest pending jobs wins; ties go to the partition with more idle nodes,
+# then to the order given.  A partition with no node up is skipped.
+pick_partition() {  # candidates...
+  local best= bestkey= p pend idle up key
+  for p in "$@"; do
+    up=$(sinfo -h -p "$p" -t idle,mix,alloc -o '%D' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    [ "$up" -gt 0 ] || continue
+    pend=$(squeue -h -p "$p" -t PD 2>/dev/null | wc -l)
+    idle=$(sinfo -h -p "$p" -t idle -o '%D' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    key=$(printf '%06d %06d' "$pend" $((999999 - idle)))
+    if [ -z "$best" ] || [[ "$key" < "$bestkey" ]]; then best=$p; bestkey=$key; fi
+  done
+  echo "$best"
+}
+
+# ---- 1. is there anything new? -------------------------------------------
+cd "$T/charmm" || fail "no checkout at $T/charmm"
+branch=$(git rev-parse --abbrev-ref HEAD)
+[ "$branch" = master ] || fail "checkout is on '$branch', not master"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  fail "checkout has uncommitted changes to tracked files"
+fi
+git fetch -q "$REMOTE" master 2> "$STATE/fetch.err" || fail "git fetch failed: $(tail -1 "$STATE/fetch.err")"
+new=$(git rev-parse FETCH_HEAD)
+last=$(cat "$STATE/last_commit" 2>/dev/null || echo none)
+if [ "$new" = "$last" ] && [ $FORCE -eq 0 ]; then
+  log "master is still ${new:0:9}, already tested; nothing to do"
+  exit 0
+fi
+log "master ${last:0:9} -> ${new:0:9}"
+
+# Leftover harness jobs would write into the directories this run cleans.
+if squeue -h -u "$USER" -o '%j' | grep -Eq -- '-(build|test|pytest)$'; then
+  fail "charmm-test jobs are still in the queue; not starting another run"
+fi
+
+cpu_part=$(pick_partition $CPU_PARTITIONS)
+gpu_part=$(pick_partition $GPU_PARTITIONS)
+[ -n "$cpu_part" ] && [ -n "$gpu_part" ] || fail "no usable partition (cpu='$cpu_part' gpu='$gpu_part')"
+log "partitions: cpu jobs -> $cpu_part, gpu jobs -> $gpu_part"
+
+if [ $DRY -eq 1 ]; then log "dry run; stopping before anything is changed"; exit 0; fi
+
+git merge -q --ff-only FETCH_HEAD || fail "cannot fast-forward the checkout to ${new:0:9}"
+
+# ---- 2. build and test ----------------------------------------------------
+stamp=$(date +%F)
+run=$STATE/$stamp-${new:0:9}
+mkdir -p "$run"
+if [ "$last" != none ] && git cat-file -e "$last" 2>/dev/null; then
+  git log --oneline "$last..$new" > "$run/commits.txt"
+else
+  git log --oneline -1 "$new" > "$run/commits.txt"
+fi
+
+cd "$T" || exit 1
+all=$($CT list | awk 'NR>2 {print $1}')
+cpu_cfgs=; gpu_cfgs=
+for c in $all; do
+  case " $GPU_CONFIGS " in *" $c "*) gpu_cfgs="$gpu_cfgs $c" ;; *) cpu_cfgs="$cpu_cfgs $c" ;; esac
+done
+
+$CT clean > "$run/clean.log" 2>&1
+# shellcheck disable=SC2086
+$CT run --no-pull --partition "$cpu_part" $cpu_cfgs > "$run/submit.log" 2>&1
+# shellcheck disable=SC2086
+$CT run --no-pull --partition "$gpu_part" $gpu_cfgs >> "$run/submit.log" 2>&1
+jobs=$(grep -o '(job [0-9]*)' "$run/submit.log" | grep -o '[0-9]*' | sort -un | paste -sd, -)
+[ -n "$jobs" ] || fail "nothing was submitted; see $run/submit.log"
+log "submitted jobs $jobs"
+
+deadline=$(( $(date +%s) + MAX_WAIT_HOURS * 3600 ))
+while [ -n "$(squeue -h -j "$jobs" 2>/dev/null)" ]; do
+  if [ "$(date +%s)" -gt "$deadline" ]; then
+    scancel "$jobs"
+    log "jobs still queued or running after $MAX_WAIT_HOURS h; cancelled the rest"
+    echo "Jobs were still queued or running after $MAX_WAIT_HOURS hours and were cancelled; the results below are partial." > "$run/timeout.txt"
+    break
+  fi
+  sleep 300
+done
+
+# ---- 3. grade and report --------------------------------------------------
+sacct -j "$jobs" -n -X -o jobname%20,partition%10,state%12,elapsed > "$run/jobs.txt" 2>/dev/null
+$CT grade --quiet --xml "$run/grade.xml" > "$run/grade.txt" 2>&1
+$CT report --xml "$run/grade.xml" --date "$stamp" > "$run/report.log" 2>&1
+report=$T/reports/$stamp.md
+
+{
+  echo "CHARMM nightly test run, $stamp"
+  echo "master ${last:0:9} -> ${new:0:9}; cpu jobs on $cpu_part, gpu jobs on $gpu_part"
+  echo
+  [ -f "$run/timeout.txt" ] && { cat "$run/timeout.txt"; echo; }
+  echo "Commits tested since the last run:"
+  sed 's/^/  /' "$run/commits.txt"
+  echo
+  bad_builds=$(awk '$1 ~ /-build$/ && $3 != "COMPLETED" {print "  " $1 " " $3}' "$run/jobs.txt")
+  if [ -n "$bad_builds" ]; then echo "BUILDS THAT DID NOT COMPLETE:"; echo "$bad_builds"; echo; fi
+  echo "Grade against the benchmark:"
+  grep -E '^\s+\S+\s+(PASS|FAIL|ERROR|SKIP)' "$run/grade.txt"
+  echo
+  if [ -f "$report" ]; then cat "$report"; else echo "No report was written; see $run/report.log"; fi
+} > "$run/mail.txt"
+
+nreg=$(grep -m1 -o 'Regressions ([0-9]*)' "$report" 2>/dev/null | grep -o '[0-9]*')
+nbad=$(awk '$1 ~ /-build$/ && $3 != "COMPLETED"' "$run/jobs.txt" | wc -l)
+subject="[CHARMM nightly] ${new:0:9}: ${nreg:-?} new failures"
+[ "$nbad" -gt 0 ] && subject="$subject, $nbad builds failed"
+send "$subject" "$run/mail.txt"
+
+echo "$new" > "$STATE/last_commit"
+log "done: $subject; report $report"

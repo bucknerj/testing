@@ -399,6 +399,12 @@ def test_script(name, test_args):
         module load anaconda/miniconda-latest
         eval "$(conda shell.bash hook)"
         conda activate "$HOME/testing/env/test"
+        # Jobs start from a clean environment (--export=NONE), so they miss
+        # what /etc/profile.d/openmpi.sh gives a login shell.  Without these
+        # Open MPI tries UCX, which fails to initialise on the compute nodes,
+        # and every MPI-linked charmm stops with "No components were able to
+        # be opened in the pml framework".
+        export OMPI_MCA_pml=^ucx OMPI_MCA_osc=^ucx
         set -u
 
         cd "$HOME/testing/install-{name}/test"
@@ -429,6 +435,7 @@ def pytest_script(name):
         module load anaconda/miniconda-latest
         eval "$(conda shell.bash hook)"
         conda activate "$HOME/testing/env/test"
+        export OMPI_MCA_pml=^ucx OMPI_MCA_osc=^ucx  # see test_script
         set -u
 
         cd "$HOME/testing/install-{name}"

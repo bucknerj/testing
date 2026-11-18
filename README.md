@@ -84,6 +84,78 @@ See `setup.bash` for the exact `conda create` invocation.
 |------|---------|
 | `charmm-test` | Main CLI tool (self-contained, no external deps) |
 | `setup.bash` | One-time conda environment and CHARMM clone setup |
+| `nightly` | Cron script: test master when it has changed, mail the report |
+
+## Nightly runs
+
+`nightly` is meant for the crontab of the account that owns `~/testing`:
+
+```
+15 2 * * * $HOME/testing/nightly >> $HOME/testing/nightly-state/cron.log 2>&1
+```
+
+Each night it
+
+1. fetches `master` and stops if it is the commit the last nightly run
+   tested, so nothing is submitted on a day without changes;
+2. looks at the queues and sends the jobs to the candidate partition with
+   the fewest pending jobs (ties go to the one with more idle nodes);
+3. archives the old outputs, builds and tests every configuration, and
+   waits for the jobs;
+4. grades against the benchmark, writes `reports/<date>.md` with
+   `charmm-test report` (regressions and fixes against the previous
+   report), and mails it.
+
+Settings are in `~/testing/nightly.conf` (optional, bash):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `MAILTO` | unset | Address the report is mailed to; unset means no mail |
+| `REMOTE` | `origin` | Remote name or URL to fetch `master` from. Keep the file mode 600 if the URL carries a token |
+| `CPU_PARTITIONS` | `cpu gpuA5500` | Candidates for jobs that need no GPU |
+| `GPU_PARTITIONS` | `gpuA5500 gpu2080 ada5000 ada6000` | Candidates for the `gpu` and `gpu2` configurations |
+| `MAX_WAIT_HOURS` | `10` | After this the remaining jobs are cancelled and a partial report is sent |
+
+`nightly --dry-run` shows what it would do (the commit check and the
+partition choice) without changing anything; `nightly --force` runs even
+if master has not moved. Each run leaves its logs in
+`~/testing/nightly-state/<date>-<commit>/`. A run that cannot start (the
+checkout is not on master, has local changes, the fetch fails, harness
+jobs are still queued) mails that instead of a report.
+
+The mail's subject line carries the number of regressions, so a quiet
+night reads `0 new failures` without opening it.
+
+## Benchmark policy
+
+The benchmark (`install-*/test/bench/`) is what every run is graded
+against. `nightly` never changes it: a benchmark that follows master
+automatically would absorb a regression the night after it happened.
+
+Regressions are found a different way. `charmm-test report` compares each
+run with the previous run's results, test by test, so a test that passed
+yesterday and fails today is reported whatever the benchmark says. The
+benchmark only decides the numbers a non-self-checking test is diffed
+against.
+
+Rotate it by hand, with `charmm-test bench`, when one of these happens:
+
+1. **A release is tagged.** The tagged commit becomes the benchmark.
+2. **A merge changes numbers on purpose** (a corrected energy term, a new
+   default). Promote once the run after the merge shows only the expected
+   diffs, so they stop being reported every night.
+3. **A testcase is added or rewritten** and has no benchmark output yet.
+   Promote just the configurations that run it.
+
+Before promoting: the run being promoted must be from a clean
+`charmm-test clean` + `run`, its regressions list must be empty or
+understood, and no build may have failed. A crashed test stays a failure
+after promotion (the grade checks termination before it looks at the
+benchmark), so promoting cannot hide a crash.
+
+After promoting: record the commit, the date and the reason in
+`BENCH_PROVENANCE.txt`. `charmm-test bench` keeps the previous benchmark
+as `bench.<timestamp>`; keep the last three and delete older ones.
 
 ## Generating documentation
 

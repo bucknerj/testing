@@ -10,9 +10,11 @@
 #      pick_partition): the candidate with the fewest pending jobs wins.
 #   3. Archives the old outputs, then builds and tests every configuration
 #      with charmm-test, and waits for the jobs.
-#   4. Grades against the benchmark, writes the report with charmm-test
-#      report (regressions and fixes against the previous report), and
-#      mails it if MAILTO is set.
+#   4. Grades against the benchmark and writes the report with charmm-test
+#      report (regressions and fixes against the previous report).
+#   5. If PACKAGE=1 and the night was clean, builds the conda package from
+#      the tested commit, tests it, and publishes it (see `package`).
+#   6. Mails the report, with the package's fate, if MAILTO is set.
 #
 # It never touches the benchmark.  See "Benchmark policy" in README.md.
 #
@@ -24,6 +26,9 @@
 #   CPU_PARTITIONS="cpu gpuA5500"   candidates for jobs that need no GPU
 #   GPU_PARTITIONS="gpuA5500 gpu2080 ada5000 ada6000"
 #   MAX_WAIT_HOURS=10
+#   PACKAGE=1                       after a clean night, build, test and
+#                                   publish the conda package (see `package`)
+#   MAX_NEW_FAILURES=0              "clean" allows this many regressions
 #
 # cron entry (02:15 every night):
 #   15 2 * * * $HOME/testing/nightly >> $HOME/testing/nightly-state/cron.log 2>&1
@@ -40,6 +45,8 @@ CPU_PARTITIONS="cpu gpuA5500"
 GPU_PARTITIONS="gpuA5500 gpu2080 ada5000 ada6000"
 MAX_WAIT_HOURS=10
 GPU_CONFIGS="gpu gpu2"
+PACKAGE=0
+MAX_NEW_FAILURES=0
 # shellcheck disable=SC1090
 [ -f "$CONF" ] && . "$CONF"
 
@@ -172,9 +179,40 @@ $CT grade --quiet --xml "$run/grade.xml" > "$run/grade.txt" 2>&1
 $CT report "$run/grade.xml" --date "$stamp" > "$run/report.log" 2>&1
 report=$T/reports/$stamp.md
 
+nreg=$(grep -m1 -o 'Regressions ([0-9]*)' "$report" 2>/dev/null | grep -o '[0-9]*')
+nbad=$(awk '$1 ~ /-build$/ && $3 != "COMPLETED"' "$run/jobs.txt" | wc -l)
+
+# ---- 4. the conda package ---------------------------------------------------
+# Built and published only after a clean night: every build completed, the
+# run was not cut short, and no more than MAX_NEW_FAILURES tests that passed
+# in the previous report fail now.  `package` then tests the built package
+# itself on a GPU node before it uploads anything.  A file named
+# nightly-state/HOLD_PACKAGE stops publishing until it is removed.
+pkg_note=
+if [ "$PACKAGE" = 1 ]; then
+  if [ -f "$STATE/HOLD_PACKAGE" ]; then
+    pkg_note="not built: $STATE/HOLD_PACKAGE exists"
+  elif [ -f "$run/timeout.txt" ]; then
+    pkg_note="not built: the test run was cut short"
+  elif [ "$nbad" -gt 0 ]; then
+    pkg_note="not built: $nbad builds did not complete"
+  elif [ -z "$nreg" ]; then
+    pkg_note="not built: no report, so the number of new failures is unknown"
+  elif [ "$nreg" -gt "$MAX_NEW_FAILURES" ]; then
+    pkg_note="not built: $nreg new test failures (limit $MAX_NEW_FAILURES)"
+  else
+    log "tests clean; building the conda package"
+    PKG_GPU_PARTITION=$gpu_part "$T/package" "$new" > "$run/package.log" 2>&1
+    pkg_note=$(grep -E '^package: (PUBLISHED|NOT PUBLISHED|built and tested)' "$run/package.log" | tail -1 | sed 's/^package: //')
+    [ -n "$pkg_note" ] || pkg_note="NOT PUBLISHED: the package step ended without a result; see $run/package.log"
+  fi
+  log "conda package: $pkg_note"
+fi
+
 {
   echo "CHARMM nightly test run, $stamp"
   echo "master ${last:0:9} -> ${new:0:9}; cpu jobs on $cpu_part, gpu jobs on $gpu_part"
+  [ -n "$pkg_note" ] && echo "Conda package: $pkg_note"
   echo
   [ -f "$run/timeout.txt" ] && { cat "$run/timeout.txt"; echo; }
   echo "Commits tested since the last run:"
@@ -188,10 +226,13 @@ report=$T/reports/$stamp.md
   if [ -f "$report" ]; then cat "$report"; else echo "No report was written; see $run/report.log"; fi
 } > "$run/mail.txt"
 
-nreg=$(grep -m1 -o 'Regressions ([0-9]*)' "$report" 2>/dev/null | grep -o '[0-9]*')
-nbad=$(awk '$1 ~ /-build$/ && $3 != "COMPLETED"' "$run/jobs.txt" | wc -l)
 subject="[CHARMM nightly] ${new:0:9}: ${nreg:-?} new failures"
 [ "$nbad" -gt 0 ] && subject="$subject, $nbad builds failed"
+case "$pkg_note" in
+  PUBLISHED*) subject="$subject; package published" ;;
+  "") ;;
+  *) subject="$subject; package NOT published" ;;
+esac
 send "$subject" "$run/mail.txt"
 
 echo "$new" > "$STATE/last_commit"

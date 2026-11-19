@@ -85,6 +85,7 @@ See `setup.bash` for the exact `conda create` invocation.
 | `charmm-test` | Main CLI tool (self-contained, no external deps) |
 | `setup.bash` | One-time conda environment and CHARMM clone setup |
 | `nightly` | Cron script: test master when it has changed, mail the report |
+| `package` | Builds the conda package from a commit, tests it on a GPU node, publishes it |
 
 ## Nightly runs
 
@@ -125,6 +126,53 @@ jobs are still queued) mails that instead of a report.
 
 The mail's subject line carries the number of regressions, so a quiet
 night reads `0 new failures` without opening it.
+
+## The conda package
+
+The CHARMM conda package (recipe in the CHARMM tree, `tool/conda/`) is
+rebuilt and published by the nightly run, with two gates in front of the
+upload so that a bad merge does not reach users.
+
+**Gate 1, in `nightly`: was the night clean?** With `PACKAGE=1` in
+`nightly.conf`, the package step runs only if every build completed, the
+test run was not cut short, and no more than `MAX_NEW_FAILURES` (default 0)
+tests that passed in the previous report fail now.
+
+**Gate 2, in `package`: does the built package work?** `package <commit>`
+exports that commit, builds the package with rattler-build, installs it in
+a fresh environment, and runs, in a Slurm job on a GPU node with nothing
+activated, the package's own `share/charmm/package_check.py` and seven
+testcases (CPU, OpenMM, BLaDE). Only if all of that passes is the package
+added to the channel and uploaded. A failure at any point leaves the
+published channel as it was, and the mail says why.
+
+The mail's subject ends with `package published` or `package NOT
+published`, and the body has one line with the reason.
+
+| To do this | Do this |
+|---|---|
+| Stop publishing for a while | `touch ~/testing/nightly-state/HOLD_PACKAGE` (remove it to resume) |
+| Build and test without publishing | `~/testing/package --no-publish <commit>` |
+| Publish a commit by hand | `~/testing/package <commit>` |
+| Take a bad build back | `~/testing/package --withdraw <file name>`: it leaves the index, so installs get the previous build |
+
+Where things are: build tools in `~/testing/env/pkg` (rattler-build,
+conda-index, patchelf, zstd); the published channel in
+`~/testing/conda-channel` (the newest `PKG_KEEP`, default 5, builds are in
+the index); scratch for the current build in `~/testing/package-work`.
+Uploads use a deploy token that may write packages, kept as a curl config
+file, `~/.config/charmm-nightly/publish.curl`, mode 600:
+
+```
+header = "Deploy-Token: <token>"
+```
+
+Without that file everything up to the upload still runs and the result
+reads "built and tested, but there is no publish token".
+
+The registry keeps every file ever uploaded; withdrawing or ageing out a
+build only removes it from the index. Deleting files from the registry
+needs a Maintainer.
 
 ## Benchmark policy
 

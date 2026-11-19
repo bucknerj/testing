@@ -1,0 +1,177 @@
+#!/bin/bash
+# Build the CHARMM conda package from one commit, test the built package on a
+# GPU node, and publish it to the GitLab package registry only if it passed.
+#
+#   package [--no-publish] [--keep N] <commit>      build, test, publish
+#   package --withdraw <package file name>           take a published build out of the index
+#
+# Called by `nightly` after a night whose tests were clean (see README.md,
+# "The conda package"); can also be run by hand on the gollum login node.
+#
+# Steps, each of which must succeed for the next to run:
+#   1. export <commit> from ~/testing/charmm (git archive: a clean tree);
+#   2. rattler-build with the recipe in that tree (tool/conda), which ends by
+#      installing the package in a fresh environment and starting it;
+#   3. install the new package in a second fresh environment and, in a Slurm
+#      job on a GPU node with nothing activated, run its own
+#      share/charmm/package_check.py and a handful of testcases;
+#   4. add the package to the channel directory, index it, upload the package
+#      and the index.
+# A failure anywhere leaves the published channel exactly as it was.
+#
+# Runs on the login node: steps 2 and 3 download from conda-forge, which the
+# compute nodes cannot reach.  The build is niced and limited to 8 cores.
+#
+# Settings (environment, or ~/testing/nightly.conf when called from nightly):
+#   PKG_GPU_PARTITION   partition for the test job              [gpuA5500]
+#   PKG_CUDA_CAP        newest CUDA the nodes' driver supports  [13.0]
+#   PKG_KEEP            builds kept in the index                [5]
+# The upload needs ~/.config/charmm-nightly/publish.curl, a curl config file
+# (mode 600) holding the header of a deploy token that may write packages:
+#   header = "Deploy-Token: <token>"
+# Without it everything up to step 3 still runs and nothing is published.
+
+set -uo pipefail
+T=$HOME/testing
+PKG=$T/package-work                 # scratch for one build; wiped each time
+CHANNEL=$T/conda-channel            # what is published, kept between runs
+TOOLS=$T/env/pkg                    # rattler-build, conda-index, patchelf
+HOSTNAME_GL=${GITLAB_HOST:-charmm-dev.org:1976}
+REGISTRY="https://$HOSTNAME_GL/api/v4/projects/${CHARMM_GITLAB_PROJECT:-5}/packages/generic/${CHARMM_CONDA_CHANNEL:-conda}"
+CURLCFG=$HOME/.config/charmm-nightly/publish.curl
+GPU_PART=${PKG_GPU_PARTITION:-gpuA5500}
+CUDA_CAP=${PKG_CUDA_CAP:-13.0}
+KEEP=${PKG_KEEP:-5}
+
+say() { echo "package: $*"; }
+die() { echo "package: NOT PUBLISHED: $*"; exit 1; }
+
+upload() {  # local file, platform directory
+  local code
+  code=$(curl -s -K "$CURLCFG" -o /dev/null -w '%{http_code}' --upload-file "$1" "$REGISTRY/$2/$(basename "$1")")
+  [ "$code" = 201 ] || die "upload of $(basename "$1") failed (HTTP $code)"
+}
+
+index_and_upload() {  # optional: one new package file to upload first
+  python -m conda_index "$CHANNEL" > "$PKG/index.log" 2>&1 || die "conda index failed; see $PKG/index.log"
+  [ -n "${1:-}" ] && upload "$1" linux-64
+  local sub
+  for sub in linux-64 noarch; do
+    zstd -q -f -19 "$CHANNEL/$sub/repodata.json" -o "$CHANNEL/$sub/repodata.json.zst"
+    upload "$CHANNEL/$sub/repodata.json.zst" "$sub"
+    upload "$CHANNEL/$sub/repodata.json" "$sub"
+  done
+}
+
+activate_tools() {
+  set +u
+  # shellcheck disable=SC1091
+  . /etc/profile >/dev/null 2>&1
+  module load anaconda/miniconda-latest >/dev/null 2>&1 || module load anaconda/miniconda-latest >/dev/null 2>&1
+  eval "$(conda shell.bash hook)"
+  set -u
+  [ -x "$TOOLS/bin/rattler-build" ] || die "no build tools at $TOOLS (conda create -p $TOOLS -c conda-forge rattler-build conda-index patchelf zstd)"
+  export PATH=$TOOLS/bin:$PATH
+}
+
+PUBLISH=1
+case "${1:-}" in
+  --withdraw)
+    file=${2:?usage: package --withdraw <package file name>}
+    [ -f "$CURLCFG" ] || die "no $CURLCFG"
+    [ -f "$CHANNEL/linux-64/$file" ] || die "$file is not in $CHANNEL/linux-64"
+    activate_tools; mkdir -p "$PKG"
+    mkdir -p "$CHANNEL/withdrawn" && mv "$CHANNEL/linux-64/$file" "$CHANNEL/withdrawn/"
+    index_and_upload
+    say "withdrawn: $file is no longer in the index (the file itself stays in the registry)"
+    exit 0 ;;
+esac
+while [ $# -gt 1 ]; do
+  case $1 in
+    --no-publish) PUBLISH=0 ;;
+    --keep) KEEP=$2; shift ;;
+    *) die "unknown option $1" ;;
+  esac
+  shift
+done
+commit=${1:?usage: package [--no-publish] [--keep N] <commit>}
+
+exec 8> "$T/nightly-state/package.lock"
+flock -n 8 || die "another package build is running"
+
+activate_tools
+sha=$(git -C "$T/charmm" rev-parse --short=9 "$commit^{commit}" 2>/dev/null) || die "unknown commit $commit"
+say "building from $sha"
+
+# ---- 1. a clean copy of the source ----------------------------------------
+rm -rf "$PKG" && mkdir -p "$PKG/src" "$PKG/out"
+git -C "$T/charmm" archive "$sha" | tar -x -C "$PKG/src" || die "git archive failed"
+[ -f "$PKG/src/tool/conda/recipe.yaml" ] || die "this commit has no tool/conda/recipe.yaml"
+
+# ---- 2. build --------------------------------------------------------------
+export CHARMM_GIT_SHA=$sha CHARMM_BUILD_DATE CPU_COUNT=8
+CHARMM_BUILD_DATE=$(date +%Y%m%d)
+nice -n 15 rattler-build build --recipe "$PKG/src/tool/conda" \
+     --variant-config "$PKG/src/tool/conda/variants.yaml" \
+     --output-dir "$PKG/out" -c conda-forge > "$PKG/build.log" 2>&1 \
+  || die "the package build failed; see $PKG/build.log"
+new=$(ls "$PKG"/out/linux-64/charmm-*.conda 2>/dev/null | head -1)
+[ -n "$new" ] || die "the build produced no package; see $PKG/build.log"
+say "built $(basename "$new")"
+
+# ---- 3. test the built package on a GPU node --------------------------------
+mkdir -p "$PKG/out/noarch"
+python -m conda_index "$PKG/out" > /dev/null 2>&1
+conda create -y -q -p "$PKG/env" -c "file://$PKG/out" -c conda-forge --override-channels \
+      charmm "cuda-version<=$CUDA_CAP" > "$PKG/env.log" 2>&1 || die "the package does not install; see $PKG/env.log"
+
+cat > "$PKG/test.sbatch" <<EOF
+#!/bin/bash
+#SBATCH -J charmm-pkgtest
+#SBATCH -p $GPU_PART
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=2
+#SBATCH -t 00:40:00
+#SBATCH -o $PKG/test.out
+# Nothing is activated and the environment is bare: the package has to work from its own files.
+E=$PKG/env
+run() { env -i PATH=\$E/bin:/usr/bin:/bin HOME=\$HOME OMP_NUM_THREADS=1 "\$@"; }
+echo "host \$(hostname); \$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
+bad=0
+cd /tmp && run \$E/bin/python \$E/share/charmm/package_check.py > $PKG/check.out 2>&1
+grep -E "^(PASS|FAIL|NOTE|ALL CHECKS)|CHECK\\(S\\) FAILED" $PKG/check.out
+grep -q "^ALL CHECKS PASSED" $PKG/check.out || bad=1
+cd $PKG/src/test && mkdir -p scratch
+printf '* CHARMM testcase data directory assignment\\n*\\nfaster on\\nset pnode = \\nif ?numnode .gt. 1 set pnode = node 0\\nset 0 data/\\nset 9 scratch/\\nset testcheck stream @0/test.str\\nset qcheck stream @0/qtest.str\\nset testfail 0\\nreturn\\n' > datadir.def
+for t in c20test/brbtest c22test/ewtipdyn c52test/cons_clear c52test/omm_noe c37test/omm_restraints c47test/blade_energy c52test/blade_restraint_gate; do
+  n=\$(basename \$t)
+  run \$E/bin/charmm -i \$t.inp -prevclcg < /dev/null > scratch/\$n.out 2>&1
+  if grep -q "NORMAL TERMINATION" scratch/\$n.out && ! grep -qi "TESTCASE RESULT: FAIL" scratch/\$n.out; then
+    echo "ok    \$n (\$(grep -ci 'result: pass' scratch/\$n.out) self-checks passed)"
+  else
+    echo "BAD   \$n"; bad=1
+  fi
+done
+[ \$bad -eq 0 ] && echo "PACKAGE TEST PASSED" || echo "PACKAGE TEST FAILED"
+EOF
+job=
+for _ in 1 2 3; do job=$(sbatch --parsable --export=NONE "$PKG/test.sbatch" 2>/dev/null); [ -n "$job" ] && break; sleep 5; done
+[ -n "$job" ] || die "could not submit the test job"
+deadline=$(( $(date +%s) + 3600 ))
+while [ -n "$(squeue -h -j "$job" 2>/dev/null)" ]; do
+  [ "$(date +%s)" -gt "$deadline" ] && { scancel "$job"; die "the test job did not finish within an hour on $GPU_PART"; }
+  sleep 30
+done
+sleep 10    # the output file arrives over NFS a little after the job ends
+sed 's/^/package:   /' "$PKG/test.out" 2>/dev/null
+grep -q "^PACKAGE TEST PASSED" "$PKG/test.out" 2>/dev/null || die "the built package failed its tests on $GPU_PART; see $PKG/test.out"
+
+# ---- 4. publish ---------------------------------------------------------------
+if [ $PUBLISH -eq 0 ]; then say "built and tested; --no-publish given, so nothing was uploaded"; exit 0; fi
+[ -f "$CURLCFG" ] || die "built and tested, but there is no publish token ($CURLCFG)"
+mkdir -p "$CHANNEL/linux-64" "$CHANNEL/noarch" "$CHANNEL/old"
+cp "$new" "$CHANNEL/linux-64/"
+# Keep the newest $KEEP builds in the index; older ones leave it (their files stay in the registry).
+ls -t "$CHANNEL"/linux-64/charmm-*.conda | tail -n +$((KEEP + 1)) | while read -r old; do mv "$old" "$CHANNEL/old/"; done
+index_and_upload "$CHANNEL/linux-64/$(basename "$new")"
+say "PUBLISHED $(basename "$new")"

@@ -1,0 +1,59 @@
+#!/bin/bash
+# Publish a new conda package from master once a month.  For cron:
+#
+#   30 4 1-7 * * $HOME/testing/package-monthly >> $HOME/testing/nightly-state/cron.log 2>&1
+#
+# It runs on the first seven mornings of the month and does nothing once that
+# month's package is out, so a morning when the cluster or the network is
+# down is simply retried the next day.  Each attempt mails its result (MAILTO
+# in ~/testing/nightly.conf).
+#
+# The package is built from the tip of master as fetched at that moment, and
+# `package` installs and tests the built package on a GPU node before it
+# uploads anything; a build that fails those tests is not published and the
+# previous package stays.  A file nightly-state/HOLD_PACKAGE pauses this.
+#
+#   package-monthly --force      publish now, whatever the month's state
+set -u
+T=$HOME/testing
+STATE=$T/nightly-state
+MAILTO=
+REMOTE=origin
+PKG_GPU_PARTITIONS="gpuA5500 gpu2080 ada5000 ada6000"
+# shellcheck disable=SC1090
+[ -f "$T/nightly.conf" ] && . "$T/nightly.conf"
+mkdir -p "$STATE"
+log() { echo "$(date '+%F %T') package-monthly: $*"; }
+
+month=$(date +%Y-%m)
+if [ "${1:-}" != --force ] && [ "$(cat "$STATE/package_month" 2>/dev/null)" = "$month" ]; then
+  exit 0                      # this month's package is already published
+fi
+if [ -f "$STATE/HOLD_PACKAGE" ]; then log "HOLD_PACKAGE exists; nothing done"; exit 0; fi
+
+set +u
+# shellcheck disable=SC1091
+. /etc/profile >/dev/null 2>&1
+set -u
+
+out=$STATE/package-$month.log
+{
+  cd "$T/charmm" || { echo "package: NOT PUBLISHED: no checkout at $T/charmm"; exit 1; }
+  git fetch -q "$REMOTE" master || { echo "package: NOT PUBLISHED: git fetch failed"; exit 1; }
+  commit=$(git rev-parse FETCH_HEAD)
+  echo "master is $(git log --oneline -1 "$commit")"
+  # the GPU partition with the fewest pending jobs
+  part=$(for p in $PKG_GPU_PARTITIONS; do echo "$(squeue -h -p "$p" -t PD 2>/dev/null | wc -l) $p"; done | sort -n | head -1 | cut -d' ' -f2)
+  PKG_GPU_PARTITION=${part:-gpuA5500} "$T/package" "$commit"
+} > "$out" 2>&1
+
+result=$(grep -E '^package: (PUBLISHED|NOT PUBLISHED|built and tested)' "$out" | tail -1 | sed 's/^package: //')
+[ -n "$result" ] || result="NOT PUBLISHED: the package step ended without a result"
+log "$result"
+case "$result" in
+  PUBLISHED*) echo "$month" > "$STATE/package_month"; subject="[CHARMM package] $month published" ;;
+  *)          subject="[CHARMM package] $month NOT published (will retry tomorrow, through the 7th)" ;;
+esac
+if [ -n "$MAILTO" ]; then
+  { echo "Monthly CHARMM conda package, $month"; echo "$result"; echo; cat "$out"; } | mail -s "$subject" "$MAILTO"
+fi

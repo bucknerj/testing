@@ -86,6 +86,7 @@ See `setup.bash` for the exact `conda create` invocation.
 | `setup.bash` | One-time conda environment and CHARMM clone setup |
 | `nightly` | Cron script: test master when it has changed, mail the report |
 | `package` | Builds the conda package from a commit, tests it on a GPU node, publishes it |
+| `package-monthly` | Cron script: publishes a package from master once a month |
 
 ## Nightly runs
 
@@ -130,8 +131,22 @@ night reads `0 new failures` without opening it.
 ## The conda package
 
 The CHARMM conda package (recipe in the CHARMM tree, `tool/conda/`) is
-rebuilt and published by the nightly run, with two gates in front of the
-upload so that a bad merge does not reach users.
+published from master **once a month** by `package-monthly`:
+
+```
+30 4 1-7 * * $HOME/testing/package-monthly >> $HOME/testing/nightly-state/cron.log 2>&1
+```
+
+It runs on the first seven mornings of the month and does nothing once that
+month's package is out, so a failed attempt is retried the next day. Each
+attempt mails its result. `package-monthly --force` publishes now.
+
+Whatever starts it, `package` tests the built package before uploading
+(gate 2 below), so a build that does not work is never published.
+
+The nightly run can publish as well, after every clean night, when
+`PACKAGE=1` is set in `nightly.conf`. That is off for now; the two gates it
+uses are described here because gate 2 applies to the monthly package too.
 
 **Gate 1, in `nightly`: was the night clean?** With `PACKAGE=1` in
 `nightly.conf`, the package step runs only if every build completed, the

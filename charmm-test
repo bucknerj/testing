@@ -400,11 +400,15 @@ def test_script(name, test_args):
         eval "$(conda shell.bash hook)"
         conda activate "$HOME/testing/env/test"
         # Jobs start from a clean environment (--export=NONE), so they miss
-        # what /etc/profile.d/openmpi.sh gives a login shell.  Without these
-        # Open MPI tries UCX, which fails to initialise on the compute nodes,
-        # and every MPI-linked charmm stops with "No components were able to
-        # be opened in the pml framework".
-        export OMPI_MCA_pml=^ucx OMPI_MCA_osc=^ucx
+        # what /etc/profile.d/openmpi.sh gives a login shell.  Left to choose,
+        # Open MPI takes UCX, which fails to initialise on the CPU nodes:
+        # every MPI-linked charmm stops with "No components were able to be
+        # opened in the pml framework".  Merely excluding UCX (pml=^ucx, what
+        # the login profile does) is not enough either: on the GPU nodes Open
+        # MPI then picks the "cm" transport, and any run of two or more
+        # processes hangs until the CPU limit.  Naming ob1 works for one
+        # process and for several, on both kinds of node (checked 2026-11-20).
+        export OMPI_MCA_pml=ob1 OMPI_MCA_osc=^ucx
         set -u
 
         cd "$HOME/testing/install-{name}/test"
@@ -435,7 +439,7 @@ def pytest_script(name):
         module load anaconda/miniconda-latest
         eval "$(conda shell.bash hook)"
         conda activate "$HOME/testing/env/test"
-        export OMPI_MCA_pml=^ucx OMPI_MCA_osc=^ucx  # see test_script
+        export OMPI_MCA_pml=ob1 OMPI_MCA_osc=^ucx  # see test_script
         set -u
 
         cd "$HOME/testing/install-{name}"

@@ -164,6 +164,15 @@ log "submitted jobs $jobs"
 
 deadline=$(( $(date +%s) + MAX_WAIT_HOURS * 3600 ))
 while [ -n "$(squeue -h -j "$jobs" 2>/dev/null)" ]; do
+  # A test job whose build failed stays in the queue for ever ("dependency
+  # never satisfied").  Left alone it would hold the report back until the
+  # deadline, so it is cancelled as soon as it is seen; the failed build is
+  # reported below.
+  stuck=$(squeue -h -j "$jobs" -o '%i %r' 2>/dev/null | awk '$2 == "DependencyNeverSatisfied" {print $1}' | paste -sd, -)
+  if [ -n "$stuck" ]; then
+    scancel "$stuck"
+    log "cancelled jobs whose build failed: $stuck"
+  fi
   if [ "$(date +%s)" -gt "$deadline" ]; then
     scancel "$jobs"
     log "jobs still queued or running after $MAX_WAIT_HOURS h; cancelled the rest"
